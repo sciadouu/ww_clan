@@ -1,0 +1,36 @@
+2025-08-08 10:44:26,807 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 10:44:27,009 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 10:46:28,809 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 10:46:28,963 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 11:25:44,391 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 11:25:44,596 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 11:29:09,981 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 11:29:10,231 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 11:30:15,202 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 11:30:15,611 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 12:23:31,063 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 12:23:31,247 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 13:41:11,393 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 13:41:11,553 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 13:41:17,162 - WolvesvilleBot - ERROR - log_error:203 - ERROR | Context: Errore invio notifica avvio bot | Error: 'EnhancedNotificationService' object has no attribute 'send_bot_status_update'
+Traceback (most recent call last):
+  File "/home/Shadow2003/bot.py", line 2032, in main
+    await notification_service.send_bot_status_update(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'EnhancedNotificationService' object has no attribute 'send_bot_status_update'
+2025-08-08 13:46:11,140 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 13:46:11,326 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 14:28:35,667 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 14:28:35,827 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-08 14:34:16,718 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-08 14:34:16,883 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-11 06:42:56,050 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-11 06:42:56,230 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-08-13 09:52:23,568 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-08-13 09:52:23,771 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-09-15 14:31:46,196 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-09-15 14:31:46,399 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-09-15 14:50:07,887 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-09-15 14:50:08,184 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging
+2025-09-15 20:10:05,913 - WolvesvilleBot - INFO - setup_logging:151 - Sistema logging inizializzato
+2025-09-15 20:10:06,850 - WolvesvilleBot - INFO - add_telegram_handler:158 - Handler Telegram aggiunto al sistema di logging

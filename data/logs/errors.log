@@ -1,0 +1,6 @@
+2025-08-08 13:41:17,162 - WolvesvilleBot - ERROR - log_error:203 - ERROR | Context: Errore invio notifica avvio bot | Error: 'EnhancedNotificationService' object has no attribute 'send_bot_status_update'
+Traceback (most recent call last):
+  File "/home/Shadow2003/bot.py", line 2032, in main
+    await notification_service.send_bot_status_update(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'EnhancedNotificationService' object has no attribute 'send_bot_status_update'
