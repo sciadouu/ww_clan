@@ -17,3 +17,5 @@
 [user]
 	email = lilian.dont14@gmail.com
 	name = sciaoduu
+[pull]
+	rebase = true
