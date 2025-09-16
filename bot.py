@@ -9,7 +9,7 @@ import json
 import os
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 
 # Librerie di terze parti
 import requests
@@ -1284,6 +1284,86 @@ async def get_available_missions() -> List[Dict]:
                 logger.error(f"Errore nel recupero delle missioni: status {resp.status}")
                 return []
 
+async def get_clan_member_ids(session: Optional[aiohttp.ClientSession] = None) -> List[str]:
+    """Recupera gli ID di tutti i membri del clan per gestire la partecipazione alle missioni."""
+
+    close_session = False
+    members: List[Dict[str, Any]] = []
+
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        url = f"https://api.wolvesville.com/clans/{CLAN_ID}/members"
+        headers = {
+            "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
+            "Accept": "application/json",
+        }
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                error_body = await resp.text()
+                logger.error(
+                    "Errore nel recupero dei membri del clan: status %s, risposta %s",
+                    resp.status,
+                    error_body,
+                )
+                return []
+
+            data = await resp.json()
+            if isinstance(data, list):
+                members = data
+            elif isinstance(data, dict):
+                members_value = data.get("members", [])
+                if isinstance(members_value, list):
+                    members = members_value
+                else:
+                    logger.error("Formato inatteso nella risposta dei membri del clan: %s", data)
+                    return []
+            else:
+                logger.error("Formato inatteso nella risposta dei membri del clan: %s", data)
+                return []
+    except Exception as exc:
+        logger.error("Eccezione durante il recupero dei membri del clan: %s", exc)
+        return []
+    finally:
+        if close_session:
+            await session.close()
+
+    member_ids: List[str] = []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+
+        member_id = (
+            member.get("playerId")
+            or member.get("id")
+            or member.get("memberId")
+            or member.get("userId")
+        )
+
+        if not member_id:
+            player_data = member.get("player")
+            if isinstance(player_data, dict):
+                member_id = (
+                    player_data.get("playerId")
+                    or player_data.get("id")
+                    or player_data.get("userId")
+                )
+
+        if member_id:
+            member_ids.append(str(member_id))
+        else:
+            logger.warning("Impossibile determinare l'ID per il membro: %s", member)
+
+    unique_member_ids = list(dict.fromkeys(member_ids))
+    if not unique_member_ids:
+        logger.warning("Nessun ID valido trovato nella lista dei membri del clan.")
+
+    return unique_member_ids
+
+
+
 @dp.message(Command("partecipanti"))
 async def partecipanti_command(message: types.Message, state: FSMContext):
     """
@@ -1358,25 +1438,149 @@ async def enable_votes_callback(callback: types.CallbackQuery, state: FSMContext
         logger.warning(f"Errore nella cancellazione del messaggio: {e}")
     if decision == "yes":
         data = await state.get_data()
-        mission_player_ids = data.get("mission_player_ids", [])
-        logger.info(f"Abilitazione - numero di player: {len(mission_player_ids)}")
+        mission_player_ids_raw = data.get("mission_player_ids", [])
+        selected_mission_id = data.get("selected_mission_id")
+
+        mission_player_ids = [str(pid) for pid in mission_player_ids_raw]
+        mission_player_ids = list(dict.fromkeys(mission_player_ids))
+        logger.info(
+            "Abilitazione - numero di player unici con voto per la missione %s: %s",
+            selected_mission_id,
+            len(mission_player_ids),
+        )
         if not mission_player_ids:
             await callback.message.answer("Nessun player ha votato per questa missione.")
+            await state.clear()
             return
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {"participateInQuests": True}
-            for pid in mission_player_ids:
-                url_put = f"https://api.wolvesville.com/clans/{CLAN_ID}/members/{pid}/participateInQuests"
-                async with session.put(url_put, headers=headers, json=payload) as resp:
-                    response_text = await resp.text()
-                    logger.info(f"PUT {url_put} -> {resp.status}, {response_text}")
-                    if resp.status not in [200, 201, 204]:
-                        logger.error(f"Errore nell'abilitazione del membro {pid}: {resp.status}")
-        await callback.message.answer("I partecipanti che hanno votato sono stati abilitati.")
+        if not selected_mission_id:
+            logger.error("Missione selezionata non trovata nello state dell'FSM.")
+            await callback.message.answer(
+                "Impossibile determinare la missione selezionata. Ripeti l'operazione."
+            )
+            await state.clear()
+            return
+
+        disable_failures: List[str] = []
+        enable_failures: List[str] = []
+        warning_messages: List[str] = []
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                all_member_ids = await get_clan_member_ids(session)
+                json_headers = {
+                    "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
+                    "Content-Type": "application/json",
+                }
+
+                if all_member_ids:
+                    disable_payload = {"participateInQuests": False}
+                    for member_id in all_member_ids:
+                        url_put_disable = (
+                            f"https://api.wolvesville.com/clans/{CLAN_ID}/members/{member_id}/participateInQuests"
+                        )
+                        async with session.put(
+                            url_put_disable, headers=json_headers, json=disable_payload
+                        ) as resp:
+                            response_text = await resp.text()
+                            logger.info(
+                                "PUT %s -> %s, %s",
+                                url_put_disable,
+                                resp.status,
+                                response_text,
+                            )
+                            if resp.status not in [200, 201, 204]:
+                                disable_failures.append(str(member_id))
+                                logger.error(
+                                    "Errore nella disattivazione del membro %s: status %s, risposta %s",
+                                    member_id,
+                                    resp.status,
+                                    response_text,
+                                )
+                else:
+                    warning_messages.append(
+                        "⚠️ Impossibile recuperare la lista completa dei membri, salto la disattivazione preventiva."
+                    )
+                    logger.warning(
+                        "Lista membri vuota durante la disattivazione preventiva dei partecipanti alla missione."
+                    )
+
+                enable_payload = {"participateInQuests": True}
+                for pid in mission_player_ids:
+                    url_put_enable = (
+                        f"https://api.wolvesville.com/clans/{CLAN_ID}/members/{pid}/participateInQuests"
+                    )
+                    async with session.put(
+                        url_put_enable, headers=json_headers, json=enable_payload
+                    ) as resp:
+                        response_text = await resp.text()
+                        logger.info(
+                            "PUT %s -> %s, %s",
+                            url_put_enable,
+                            resp.status,
+                            response_text,
+                        )
+                        if resp.status not in [200, 201, 204]:
+                            enable_failures.append(str(pid))
+                            logger.error(
+                                "Errore nell'abilitazione del membro %s: status %s, risposta %s",
+                                pid,
+                                resp.status,
+                                response_text,
+                            )
+
+                await callback.message.answer("I partecipanti che hanno votato sono stati abilitati.")
+
+                claim_url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/claim"
+                claim_headers = {
+                    "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+                claim_payload = {"questId": selected_mission_id}
+
+                async with session.post(
+                    claim_url, headers=claim_headers, json=claim_payload
+                ) as resp:
+                    claim_body = await resp.text()
+                    if resp.status in [200, 201, 204]:
+                        await callback.message.answer("🚀 Missione avviata con successo.")
+                        logger.info(
+                            "Missione %s avviata con successo: %s",
+                            selected_mission_id,
+                            claim_body,
+                        )
+                    else:
+                        logger.error(
+                            "Errore nell'avvio della missione %s: status %s, risposta %s",
+                            selected_mission_id,
+                            resp.status,
+                            claim_body,
+                        )
+                        await callback.message.answer(
+                            f"⚠️ Impossibile avviare la missione (status {resp.status})."
+                        )
+
+                for message_text in warning_messages:
+                    await callback.message.answer(message_text)
+
+                if disable_failures:
+                    await callback.message.answer(
+                        f"⚠️ Disattivazione non riuscita per {len(disable_failures)} membri. Controlla i log per i dettagli."
+                    )
+
+                if enable_failures:
+                    await callback.message.answer(
+                        f"⚠️ Abilitazione non riuscita per {len(enable_failures)} partecipanti. Controlla i log per i dettagli."
+                    )
+        except Exception as exc:
+            logger.error(
+                "Errore durante la gestione dell'abilitazione missione per %s: %s",
+                selected_mission_id,
+                exc,
+            )
+            await callback.message.answer(
+                "Si è verificato un errore durante l'abilitazione dei partecipanti. Riprova più tardi."
+            )
     else:
         await callback.message.answer("Abilitazione annullata.")
     await state.clear()
