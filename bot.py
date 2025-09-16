@@ -29,8 +29,18 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from services.notification_service import EnhancedNotificationService
-from config import TOKEN, WOLVESVILLE_API_KEY, CLAN_ID, SKIP_IMAGE_PATH, BOT_PASSWORD, AUTHORIZED_GROUPS,OWNER_CHAT_ID,ADMIN_NOTIFICATION_CHANNEL, ADMIN_IDS
+from services.notification_service import EnhancedNotificationService, NotificationType
+from config import (
+    TOKEN,
+    WOLVESVILLE_API_KEY,
+    CLAN_ID,
+    SKIP_IMAGE_PATH,
+    BOT_PASSWORD,
+    AUTHORIZED_GROUPS,
+    OWNER_CHAT_ID,
+    ADMIN_NOTIFICATION_CHANNEL,
+    ADMIN_IDS,
+)
 # Import moduli settimana 1 con gestione errori
 try:
     from middleware.auth_middleware import GroupAuthorizationMiddleware
@@ -57,9 +67,25 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Otteniamo l'IP esterno (verifica se necessario l'uso in produzione)
-ip = requests.get("https://ifconfig.me/ip").text.strip()
-print("Il mio IP è:", ip)
+LOG_PUBLIC_IP = os.getenv("LOG_PUBLIC_IP", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def maybe_log_public_ip() -> None:
+    """Recupera e registra l'IP pubblico solo quando esplicitamente richiesto."""
+
+    if not LOG_PUBLIC_IP:
+        return
+
+    try:
+        response = requests.get("https://ifconfig.me/ip", timeout=5)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Impossibile recuperare l'IP pubblico: %s", exc)
+        return
+
+    public_ip = response.text.strip()
+    if public_ip:
+        logger.info("IP pubblico del bot: %s", public_ip)
 
 # =============================================================================
 # CONFIGURAZIONE DI MONGODB
@@ -651,7 +677,7 @@ async def bot_kicked_from_chat(event: ChatMemberUpdated):
         )
         await notification_service.send_admin_notification(
             message,
-            notification_type=notification_service.NotificationType.WARNING,
+            notification_type=NotificationType.WARNING,
             urgent=True
         )
 
@@ -765,7 +791,7 @@ def setup_scheduler():
 
     # NUOVE funzioni per pulizia e controllo
     scheduler.add_job(clean_duplicate_users, "interval", hours=24, next_run_time=datetime.now())  # Ogni giorno
-    scheduler.add_job(check_clan_departures, "interval", minutes=5, next_run_time=datetime.now())   # Ogni 6 ore
+    scheduler.add_job(check_clan_departures, "interval", hours=6, next_run_time=datetime.now())   # Ogni 6 ore
     # NUOVO: Controllo reminder calendario
     #scheduler.add_job(calendar_service.check_pending_reminders, "interval", minutes=1)
 
@@ -2098,6 +2124,7 @@ async def show_members_page(message: types.Message, state: FSMContext):
 # FUNZIONE MAIN
 # =============================================================================
 async def main():
+    maybe_log_public_ip()
     setup_scheduler()
     await prepopulate_users()
 

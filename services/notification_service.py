@@ -19,7 +19,7 @@ class NotificationType(Enum):
 class EnhancedNotificationService:
     """
     Servizio di notifiche completo e corretto.
-    
+
     CORREZIONI IMPLEMENTATE:
     - send_startup_notification() ora invia SEMPRE al proprietario
     - send_debt_notification() ora invia al canale admin E ai singoli admin
@@ -33,7 +33,7 @@ class EnhancedNotificationService:
         self.admin_channel_id = admin_channel_id
         self.owner_id = owner_id
         self.logger = logging.getLogger(__name__)
-        
+
         # Rate limiting e tracking blacklist
         self.last_notification_time = {}
         self.min_interval = 5
@@ -71,7 +71,7 @@ class EnhancedNotificationService:
             f"• Controllo gruppi autorizzati\n"
             f"• Sistema blacklist gruppi"
         )
-        
+
         # CORREZIONE PRINCIPALE: Invia SEMPRE al proprietario
         if self.owner_id:
             try:
@@ -84,7 +84,7 @@ class EnhancedNotificationService:
                 self.logger.info(f"✅ Notifica startup inviata al proprietario {self.owner_id}")
             except Exception as e:
                 self.logger.error(f"❌ Errore invio notifica startup al proprietario: {e}")
-        
+
         # Invia anche al canale admin
         if self.admin_channel_id:
             try:
@@ -113,7 +113,7 @@ class EnhancedNotificationService:
             f"💎 **Gem:** {debt_info.get('gem', 0):,}\n\n"
             f"📅 **Timestamp:** {self.get_local_timestamp()}"
         )
-        
+
         # CORREZIONE PRINCIPALE: Invia al canale admin
         if self.admin_channel_id:
             try:
@@ -126,7 +126,7 @@ class EnhancedNotificationService:
                 self.logger.info("✅ Notifica debiti inviata al canale admin")
             except Exception as e:
                 self.logger.error(f"❌ Errore invio notifica debiti al canale admin: {e}")
-        
+
         # Invia a tutti gli admin IDs
         for admin_id in self.admin_ids:
             try:
@@ -139,7 +139,7 @@ class EnhancedNotificationService:
                 self.logger.info(f"✅ Notifica debiti inviata all'admin {admin_id}")
             except Exception as e:
                 self.logger.error(f"❌ Errore invio notifica debiti all'admin {admin_id}: {e}")
-        
+
         # CORREZIONE: Invia anche al proprietario se diverso dagli admin
         if self.owner_id and self.owner_id not in self.admin_ids:
             try:
@@ -161,14 +161,14 @@ class EnhancedNotificationService:
         # Inizializza gruppo nel tracking blacklist se non esiste
         if chat_id not in self.group_blacklist:
             self.group_blacklist[chat_id] = {"attempts": 0, "blacklisted": False}
-        
+
         # Incrementa tentativi
         self.group_blacklist[chat_id]["attempts"] += 1
         attempts = self.group_blacklist[chat_id]["attempts"]
-        
+
         # Controlla se deve essere inserito in blacklist
         should_blacklist = attempts >= self.max_attempts
-        
+
         if should_blacklist and not self.group_blacklist[chat_id]["blacklisted"]:
             # Inserisce in blacklist
             self.group_blacklist[chat_id]["blacklisted"] = True
@@ -220,10 +220,10 @@ class EnhancedNotificationService:
         METODO MANCANTE - Invia notifica per aggiornamenti stato bot.
         """
         message = f"🤖 **BOT STATUS: {status}**\n\n"
-        
+
         if details:
             message += f"📋 **Dettagli:** {details}\n\n"
-            
+
         message += f"📅 **Timestamp:** {self.get_local_timestamp()}"
 
         # Invia al canale admin
@@ -249,69 +249,6 @@ class EnhancedNotificationService:
                 )
             except Exception as e:
                 self.logger.error(f"Errore invio bot status al proprietario: {e}")
-
-    async def send_system_alert(self, title: str, details: str, error: Optional[Exception] = None):
-        """
-        METODO MANCANTE - Invia notifica per alert di sistema.
-        """
-        message = f"⚠️ **ALERT SISTEMA: {title}**\n\n{details}"
-        
-        if error:
-            message += f"\n\n🐛 **Errore:** `{str(error)}`"
-            
-        message += f"\n📅 **Timestamp:** {self.get_local_timestamp()}"
-
-        # Invia a tutti gli admin per alert di sistema
-        for admin_id in self.admin_ids:
-            try:
-                await self.bot.send_message(
-                    chat_id=admin_id,
-                    text=message,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                self.logger.error(f"Errore invio system alert all'admin {admin_id}: {e}")
-
-        # Invia anche al canale admin
-        if self.admin_channel_id:
-            try:
-                await self.bot.send_message(
-                    chat_id=self.admin_channel_id,
-                    text=message,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                self.logger.error(f"Errore invio system alert al canale admin: {e}")
-
-    async def send_user_action_alert(self, user_id: int, username: str, action: str, details: str = ""):
-        """
-        METODO MANCANTE - Invia notifica per azioni utente rilevanti.
-        """
-        message = (
-            f"👤 **AZIONE UTENTE**\n\n"
-            f"🆔 **User ID:** `{user_id}`\n"
-            f"👤 **Username:** @{username}\n"
-            f"⚡ **Azione:** {action}\n"
-        )
-
-        if details:
-            message += f"\n📋 **Dettagli:** {details}"
-            
-        message += f"\n📅 **Timestamp:** {self.get_local_timestamp()}"
-
-        # Invia al canale admin
-        if self.admin_channel_id:
-            try:
-                await self.bot.send_message(
-                    chat_id=self.admin_channel_id,
-                    text=message,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                self.logger.error(f"Errore invio user action alert: {e}")
 
     async def send_unauthorized_group_alert(self, chat_id: int, chat_title: str, user_id: Optional[int] = None, username: Optional[str] = None):
         """
@@ -339,10 +276,10 @@ class EnhancedNotificationService:
 
         # Aggiunge timestamp corretto al messaggio
         timestamped_message = f"{message}\n\n📅 **Timestamp:** {self.get_local_timestamp()}"
-        
+
         # Formatta messaggio con emoji
         formatted_message = f"{notification_type.value} **NOTIFICA BOT**\n\n{timestamped_message}"
-        
+
         # Invia al canale admin
         if self.admin_channel_id:
             try:
@@ -354,7 +291,7 @@ class EnhancedNotificationService:
                 )
             except Exception as e:
                 self.logger.error(f"Errore invio al canale admin: {e}")
-        
+
         # Invia agli admin se urgente
         if urgent:
             for admin_id in self.admin_ids:
@@ -386,7 +323,7 @@ class EnhancedNotificationService:
         """Controlla se la notifica è rate limited"""
         if notification_type not in self.last_notification_time:
             return False
-        
+
         time_diff = (datetime.now() - self.last_notification_time[notification_type]).seconds
         return time_diff < self.min_interval
 

@@ -1,13 +1,7 @@
 from typing import Final
-import os
-from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
 
 # Configurazione del bot
 TOKEN = "7649312296:AAEGUQ1PKeDhtfRarlJxI-zOxlcRC5fQ1p8"
-bot = Bot(token=TOKEN)
-storage = MemoryStorage()  # Per mantenere lo stato delle conversazioni
-dp = Dispatcher(bot=bot, storage=storage)
 OWNER_CHAT_ID: Final = 7020291568  # ID della chat dell'owner
 WAIT_TIME_SECONDS = 5  # Tempo di attesa prima di uscire dai gruppi non autorizzati
 BOT_USERNAME: Final = '@Disadattati_Bot'  # Nome utente del bot
