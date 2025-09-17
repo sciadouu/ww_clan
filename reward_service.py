@@ -29,6 +29,18 @@ class RewardService:
         """Assegna punti a un utente"""
         safe_amount = max(amount or 0, 0)
 
+        canonical_username = (username or "").strip()
+        if not canonical_username:
+            return 0
+
+        try:
+            resolution = await self.db.resolve_profile_by_game_alias(canonical_username)
+        except Exception:
+            resolution = None
+
+        if resolution and resolution.get("resolved_username"):
+            canonical_username = resolution.get("resolved_username")
+
         if point_type == "DONATION_ORO":
             base_units = safe_amount // 1000
             if safe_amount > 0:
@@ -46,6 +58,35 @@ class RewardService:
             return 0
 
         # Aggiorna database
+        await self.db.increment_reward_points(canonical_username, points)
+
+        # Controlla achievement
+        await self.check_achievements(canonical_username)
+
+        return points
+        
+    async def check_achievements(self, username: str):
+        """Controlla se l'utente ha sbloccato achievement"""
+        target_username = (username or "").strip()
+        if not target_username:
+            return []
+
+        user_data = await self.db.fetch_user(target_username)
+        if not user_data:
+            try:
+                resolution = await self.db.resolve_profile_by_game_alias(target_username)
+            except Exception:
+                resolution = None
+            if resolution and resolution.get("resolved_username"):
+                target_username = resolution.get("resolved_username")
+                user_data = await self.db.fetch_user(target_username)
+        if not user_data:
+            return []
+
+        donazioni = user_data.get("donazioni", {})
+        total_oro = donazioni.get("Oro", 0)
+        total_gem = donazioni.get("Gem", 0)
+        current_achievements = user_data.get("achievements", [])
         await self.db.increment_reward_points(username, points)
 
         # Controlla achievement
@@ -76,6 +117,7 @@ class RewardService:
             
         # Aggiorna database con nuovi achievement
         if new_achievements:
+            await self.db.add_achievements(target_username, new_achievements)
             await self.db.add_achievements(username, new_achievements)
 
         return new_achievements
