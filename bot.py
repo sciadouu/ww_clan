@@ -17,15 +17,11 @@ from urllib.parse import quote_plus
 import requests
 import aiohttp
 from PIL import Image
-import motor.motor_asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Import di Aiogram
-from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram import types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, FSInputFile, Message, ChatMemberUpdated
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import Command, ChatMemberUpdatedFilter, KICKED, MEMBER, ADMINISTRATOR
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.state import StatesGroup, State
@@ -33,7 +29,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound
 from services.notification_service import EnhancedNotificationService, NotificationType
-from services.db_manager import MongoManager
+from bot_app import create_app_context
 from config import (
     TOKEN,
     WOLVESVILLE_API_KEY,
@@ -346,8 +342,21 @@ MONGO_URI = "mongodb+srv://Admin:X3TaVDKSSQDcfUG@wolvesville.6mrnmcn.mongodb.net
 DATABASE_NAME = "Wolvesville"
 USERS_COLLECTION = "users"
 
-mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, tlsAllowInvalidCertificates=True)
-db_manager = MongoManager(mongo_client, DATABASE_NAME)
+app_context = create_app_context(
+    token=TOKEN,
+    mongo_uri=MONGO_URI,
+    database_name=DATABASE_NAME,
+    admin_ids=ADMIN_IDS,
+    admin_channel_id=ADMIN_NOTIFICATION_CHANNEL,
+    owner_id=OWNER_CHAT_ID,
+)
+
+bot = app_context.bot
+dp = app_context.dispatcher
+notification_service = app_context.notification_service
+db_manager = app_context.db_manager
+scheduler = app_context.scheduler
+mongo_client = app_context.mongo_client
 
 # Tempo di reset per considerare solo le donazioni future
 RESET_TIME = datetime.now(timezone.utc)
@@ -1340,37 +1349,22 @@ def add_clan_to_file(clan_id: str, clan_name: str):
 # =============================================================================
 # CONFIGURAZIONE DEL BOT E DEL DISPATCHER
 # =============================================================================
-bot = Bot(
-    token=TOKEN,
-    session=AiohttpSession(),
-    default=DefaultBotProperties(parse_mode="HTML")
+if bot_logger is not None:
+    bot_logger.add_telegram_handler(bot, ADMIN_IDS)
 
-)
-dp = Dispatcher(storage=MemoryStorage())
-
-# Inizializzazione servizio notifiche
-# Initialize notification service
-notification_service = EnhancedNotificationService(
-    bot=bot,
-    admin_ids=ADMIN_IDS,
-    admin_channel_id=ADMIN_NOTIFICATION_CHANNEL,
-    owner_id=OWNER_CHAT_ID
-)
-
-# Setup logging con handler Telegram
-bot_logger.add_telegram_handler(bot, ADMIN_IDS)
-
-# Inizializzazione middleware autorizzazione
-auth_middleware = GroupAuthorizationMiddleware(
-    authorized_groups=set(AUTHORIZED_GROUPS),
-    admin_ids=ADMIN_IDS,
-    notification_service=notification_service
-)
+auth_middleware = None
+if MIDDLEWARE_AVAILABLE:
+    auth_middleware = GroupAuthorizationMiddleware(
+        authorized_groups=set(AUTHORIZED_GROUPS),
+        admin_ids=ADMIN_IDS,
+        notification_service=notification_service,
+    )
 
 # Registrazione middleware nell'ordine corretto
 # IMPORTANTE: Aggiungi PRIMA dei middleware esistenti
 dp.update.middleware(LoggingMiddleware())    # Prima il logging
-dp.update.middleware(auth_middleware)        # Poi l'autorizzazione
+if auth_middleware is not None:
+    dp.update.middleware(auth_middleware)        # Poi l'autorizzazione
 
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
 async def bot_kicked_from_chat(event: ChatMemberUpdated):
@@ -1486,11 +1480,8 @@ ADMIN_IDS = [7020291568]
 # =============================================================================
 # CONFIGURAZIONE DELLO SCHEDULER
 # =============================================================================
-def setup_scheduler():
-    """
-    Configura lo scheduler per eseguire periodicamente alcune funzioni.
-    """
-    scheduler = AsyncIOScheduler(timezone="Europe/Rome")
+def setup_scheduler(scheduler: AsyncIOScheduler) -> AsyncIOScheduler:
+    """Configura lo scheduler condiviso e avvia i job di manutenzione."""
 
     # CORREZIONE: Invio skin/messaggi lunedì alle 8:00 (non 11:00)
     scheduler.add_job(
@@ -1520,8 +1511,10 @@ def setup_scheduler():
     # NUOVO: Pulizia log settimanale
     #scheduler.add_job(cleanup_old_logs, "cron", day_of_week="sun", hour=2, minute=0)
 
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.start()
     logger.info("Scheduler configurato con tutte le funzioni di manutenzione.")
+    return scheduler
 
 # =============================================================================
 # FUNZIONI VARIE DI SUPPORTO
@@ -3283,7 +3276,7 @@ async def show_members_page(message: types.Message, state: FSMContext):
 # =============================================================================
 async def main():
     maybe_log_public_ip()
-    setup_scheduler()
+    setup_scheduler(scheduler)
     await prepopulate_users()
     await refresh_linked_profiles()
 
