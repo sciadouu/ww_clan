@@ -556,6 +556,17 @@ class MongoManager:
             return changes
         return None
 
+    async def list_linked_player_profiles(self) -> List[Dict[str, Any]]:
+        """Restituisce tutti i profili con Telegram e Wolvesville collegati."""
+
+        cursor = self.player_profiles_col.find(
+            {
+                "telegram_id": {"$exists": True, "$ne": None},
+                "wolvesville_id": {"$exists": True, "$ne": None},
+            }
+        )
+        return await cursor.to_list(length=None)
+
     async def link_player_profile(
         self,
         telegram_id: int,

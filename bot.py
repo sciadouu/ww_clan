@@ -31,6 +31,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound
 from services.notification_service import EnhancedNotificationService, NotificationType
 from services.db_manager import MongoManager
 from config import (
@@ -73,6 +74,10 @@ logger = logging.getLogger(__name__)
 notification_service: Optional[EnhancedNotificationService] = None
 
 LOG_PUBLIC_IP = os.getenv("LOG_PUBLIC_IP", "false").lower() in {"1", "true", "yes", "on"}
+
+PROFILE_AUTO_SYNC_INTERVAL_MINUTES = int(
+    os.getenv("PROFILE_AUTO_SYNC_INTERVAL_MINUTES", "15")
+)
 
 
 def maybe_log_public_ip() -> None:
@@ -174,6 +179,68 @@ def build_profile_snapshot(profile: Optional[Dict[str, Any]]) -> Optional[Dict[s
     return snapshot
 
 
+def handle_telegram_sync_result(
+    result: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Invia notifiche se cambia lo username Telegram e restituisce il profilo aggiornato."""
+
+    if not result:
+        return None
+
+    profile = result.get("profile")
+    if profile is None:
+        return None
+
+    if result.get("telegram_username_changed"):
+        game_username = profile.get("game_username")
+        if game_username:
+            old_username = format_telegram_username(
+                result.get("previous_telegram_username")
+            )
+            new_username = format_telegram_username(profile.get("telegram_username"))
+            message = (
+                "♻️ **Aggiornamento username Telegram**\n\n"
+                f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
+                f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
+                f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
+            )
+            schedule_admin_notification(
+                message,
+                notification_type=NotificationType.INFO,
+            )
+
+    return profile
+
+
+def handle_profile_link_result(
+    result: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Analizza il risultato del linking e notifica variazioni allo username di gioco."""
+
+    if not result or result.get("conflict"):
+        return result.get("profile") if result else None
+
+    profile = result.get("profile")
+    if profile is None:
+        return None
+
+    if result.get("game_username_changed") and result.get("previous_game_username"):
+        telegram_display = format_telegram_username(profile.get("telegram_username"))
+        message = (
+            "♻️ **Aggiornamento username Wolvesville**\n\n"
+            f"💬 **Telegram:** {format_markdown_code(telegram_display)}\n"
+            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
+            f"🆔 **Wolvesville ID:** {format_markdown_code(profile.get('wolvesville_id'))}\n"
+            f"🔁 **Username:** {format_markdown_code(result.get('previous_game_username'))} → {format_markdown_code(profile.get('game_username'))}"
+        )
+        schedule_admin_notification(
+            message,
+            notification_type=NotificationType.INFO,
+        )
+
+    return profile
+
+
 async def resolve_member_identity(username: Optional[str]) -> Dict[str, Any]:
     """Risolvi uno username di gioco in base al profilo collegato."""
 
@@ -250,6 +317,7 @@ async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
     if not result or result.get("created"):
         return
 
+    handle_telegram_sync_result(result)
     if (
         result.get("telegram_username_changed")
         and result.get("profile")
@@ -445,6 +513,121 @@ async def prepopulate_users():
                     inserted = await db_manager.ensure_user(username)
                     if inserted:
                         logger.info(f"Utente {username} pre-popolato con bilancio 0.")
+
+
+async def refresh_linked_profiles() -> None:
+    """Sincronizza periodicamente gli username Telegram e Wolvesville già collegati."""
+
+    try:
+        profiles = await db_manager.list_linked_player_profiles()
+    except Exception as exc:
+        logger.warning("Impossibile recuperare i profili collegati: %s", exc)
+        return
+
+    if not profiles:
+        return
+
+    async with aiohttp.ClientSession() as wolvesville_session:
+        for profile in profiles:
+            telegram_id = profile.get("telegram_id")
+            if not telegram_id:
+                continue
+
+            latest_profile = profile
+
+            try:
+                chat = await bot.get_chat(telegram_id)
+            except TelegramForbiddenError:
+                logger.debug(
+                    "Sync Telegram ignorato per %s: bot bloccato", telegram_id
+                )
+            except TelegramNotFound:
+                logger.debug(
+                    "Sync Telegram ignorato per %s: utente non trovato", telegram_id
+                )
+            except TelegramBadRequest as exc:
+                logger.debug(
+                    "Sync Telegram fallito per %s: %s", telegram_id, exc
+                )
+            else:
+                chat_full_name = (
+                    " ".join(
+                        part
+                        for part in [chat.first_name, chat.last_name]
+                        if part
+                    ).strip()
+                    or None
+                )
+                try:
+                    result = await db_manager.sync_telegram_metadata(
+                        telegram_id,
+                        telegram_username=chat.username,
+                        full_name=chat_full_name,
+                    )
+                except Exception as exc:  # pragma: no cover - diagnosi schedulatore
+                    logger.warning(
+                        "Sync Telegram fallito per %s: %s", telegram_id, exc
+                    )
+                else:
+                    updated_profile = handle_telegram_sync_result(result)
+                    if updated_profile:
+                        latest_profile = updated_profile
+
+            wolvesville_id = (
+                latest_profile.get("wolvesville_id")
+                if isinstance(latest_profile, dict)
+                else profile.get("wolvesville_id")
+            )
+            if not wolvesville_id:
+                continue
+
+            player_info = await fetch_player_by_id(
+                wolvesville_id,
+                session=wolvesville_session,
+            )
+            if not player_info:
+                continue
+
+            new_username = player_info.get("username")
+            if not new_username:
+                continue
+
+            try:
+                link_result = await db_manager.link_player_profile(
+                    telegram_id,
+                    game_username=new_username,
+                    telegram_username=latest_profile.get("telegram_username")
+                    if isinstance(latest_profile, dict)
+                    else profile.get("telegram_username"),
+                    full_name=latest_profile.get("full_name")
+                    if isinstance(latest_profile, dict)
+                    else profile.get("full_name"),
+                    wolvesville_id=wolvesville_id,
+                    verified=False,
+                    verification_code=None,
+                    verification_method=None,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Aggiornamento profilo Wolvesville fallito per %s: %s",
+                    telegram_id,
+                    exc,
+                )
+                continue
+
+            if link_result and link_result.get("conflict"):
+                logger.warning(
+                    "Conflitto durante l'aggiornamento del profilo per %s: %s",
+                    telegram_id,
+                    link_result.get("reason"),
+                )
+                continue
+
+            updated_profile = handle_profile_link_result(link_result)
+            if updated_profile:
+                latest_profile = updated_profile
+
+            await asyncio.sleep(0.1)
 
 
 async def update_user_balance(username: str, currency: str, amount: int):
@@ -1073,27 +1256,38 @@ async def fetch_player_by_username(username: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
-async def fetch_player_by_id(player_id: str) -> Optional[Dict[str, Any]]:
+async def fetch_player_by_id(
+    player_id: str,
+    *,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Optional[Dict[str, Any]]:
     """Recupera un giocatore tramite ID Wolvesville."""
 
     if not player_id:
         return None
+
     url = f"https://api.wolvesville.com/players/{player_id}"
     headers = {
         "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
         "Accept": "application/json",
     }
+
+    async def _do_request(client: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
+        async with client.get(url, headers=headers) as response:
+            if response.status != 200:
+                logger.warning(
+                    "Impossibile recuperare il giocatore con ID %s (status %s)",
+                    player_id,
+                    response.status,
+                )
+                return None
+            return await response.json()
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status != 200:
-                    logger.warning(
-                        "Impossibile recuperare il giocatore con ID %s (status %s)",
-                        player_id,
-                        response.status,
-                    )
-                    return None
-                return await response.json()
+        if session is not None:
+            return await _do_request(session)
+        async with aiohttp.ClientSession() as owned_session:
+            return await _do_request(owned_session)
     except Exception as exc:
         logger.error("Errore durante il recupero del giocatore %s: %s", player_id, exc)
         return None
@@ -1310,6 +1504,12 @@ def setup_scheduler():
     scheduler.add_job(process_ledger, "interval", minutes=5, next_run_time=datetime.now())
     scheduler.add_job(process_active_mission_auto, "interval", minutes=5, next_run_time=datetime.now())
     scheduler.add_job(prepopulate_users, "interval", days=3, next_run_time=datetime.now())
+    scheduler.add_job(
+        refresh_linked_profiles,
+        "interval",
+        minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
+        next_run_time=datetime.now(),
+    )
 
     # NUOVE funzioni per pulizia e controllo
     scheduler.add_job(clean_duplicate_users, "interval", hours=24, next_run_time=datetime.now())  # Ogni giorno
@@ -3085,6 +3285,7 @@ async def main():
     maybe_log_public_ip()
     setup_scheduler()
     await prepopulate_users()
+    await refresh_linked_profiles()
 
     # NUOVO: Notifica avvio bot
     try:
