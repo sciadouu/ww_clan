@@ -522,6 +522,8 @@ async def process_mission(
 
     resolved_identities: List[Dict[str, Any]] = []
     alias_resolved_count = 0
+    unresolved_participants: List[str] = []
+
     for participant in participants:
         identity = await resolve_member_identity(participant)
         resolved_username = identity.get("resolved_username")
@@ -531,6 +533,7 @@ async def process_mission(
                 mission_type,
                 participant,
             )
+            unresolved_participants.append(participant)
             continue
         if (
             identity.get("match") == "history"
@@ -548,40 +551,15 @@ async def process_mission(
 
     if not resolved_identities:
         logger.info(
-            "Processo missione %s saltato: nessun partecipante risolto.", mission_type
+            "Processo missione %s saltato: nessun partecipante risolto.",
+            mission_type,
         )
         return None
 
+    original_participant_count = len(participants)
     participant_count = len(resolved_identities)
-                    await db_manager.log_donation(
-                        record_id,
-                        username,
-                        gold_amount,
-                        gems_amount,
-                        raw_record=record,
-                    )
+    unresolved_count = max(original_participant_count - participant_count, 0)
 
-                # Segna questo record come "già processato"
-                await db_manager.mark_ledger_processed(record_id, raw_record=record)
-
-async def process_mission(
-    participants: List[str],
-    mission_type: str,
-    *,
-    mission_id: Optional[str] = None,
-    outcome: str = "processed",
-    source: str = "manual",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    """Processa una missione, applica i costi e registra la partecipazione nel database."""
-
-    if not participants:
-        logger.info("Processo missione %s saltato: nessun partecipante fornito.", mission_type)
-        return None
-
-    mission_type = mission_type or "Unknown"
-    mission_type_lower = mission_type.lower()
-    participant_count = len(participants)
     cost = 0
     currency_key = mission_type
 
@@ -600,8 +578,6 @@ async def process_mission(
     if cost != 0:
         for identity in resolved_identities:
             await update_user_balance(identity["resolved_username"], currency_key, -cost)
-        for user in participants:
-            await update_user_balance(user, currency_key, -cost)
         logger.info(
             "Applicato costo di %s %s a %s partecipanti (missione %s).",
             cost,
@@ -623,13 +599,16 @@ async def process_mission(
         )
 
     metadata_payload = dict(metadata or {})
-    metadata_payload.setdefault("participants_count", participant_count)
+    metadata_payload.setdefault("participants_count", original_participant_count)
     metadata_payload.setdefault("cost_applied", cost)
     metadata_payload["resolved_participants_count"] = participant_count
+    metadata_payload["unresolved_participants_count"] = unresolved_count
     metadata_payload["alias_resolutions"] = alias_resolved_count
     metadata_payload["linked_participants"] = sum(
         1 for identity in resolved_identities if identity.get("telegram_id")
     )
+    if unresolved_participants:
+        metadata_payload["unresolved_participants"] = unresolved_participants
 
     participant_entries: List[Dict[str, Any]] = []
     for identity in resolved_identities:
@@ -667,6 +646,7 @@ async def process_mission(
         )
 
     return event_id
+
 
 async def process_active_mission_auto():
     """
@@ -709,6 +689,7 @@ async def process_active_mission_auto():
 
     resolved_identities: List[Dict[str, Any]] = []
     alias_resolved_count = 0
+    unresolved_usernames: List[str] = []
     for username in raw_usernames:
         identity = await resolve_member_identity(username)
         resolved_username = identity.get("resolved_username")
@@ -718,6 +699,7 @@ async def process_active_mission_auto():
                 mission_id,
                 username,
             )
+            unresolved_usernames.append(username)
             continue
         if (
             identity.get("match") == "history"
@@ -737,49 +719,62 @@ async def process_active_mission_auto():
         logger.info("Missione %s: nessun partecipante valido dopo la risoluzione.", mission_id)
         return
 
-    count = len(resolved_identities)
+    participant_count = len(resolved_identities)
 
     mission_type = "Gem" if quest.get("purchasableWithGems", False) else "Gold"
     if mission_type == "Gold":
         cost = 500
     else:
-        if 5 <= count <= 7:
-            cost = 150
-        elif count > 7:
+        if participant_count > 7:
             cost = 140
+        elif 5 <= participant_count <= 7:
+            cost = 150
         else:
             cost = 0
 
-    for identity in resolved_identities:
-        await update_user_balance(identity["resolved_username"], mission_type, -cost)
-        log_name = identity.get("resolved_username")
-        original = identity.get("original_username")
-        if original and original != log_name:
-            logger.info(
-                "Dedotto %s %s per %s (alias %s) nella missione %s",
-                cost,
-                "Oro" if mission_type == "Gold" else "Gem",
-                log_name,
-                original,
-                mission_id,
-            )
-        else:
-            logger.info(
-                "Dedotto %s %s per %s nella missione %s",
-                cost,
-                "Oro" if mission_type == "Gold" else "Gem",
-                log_name,
-                mission_id,
-            )
+    if cost:
+        for identity in resolved_identities:
+            await update_user_balance(identity["resolved_username"], mission_type, -cost)
+            log_name = identity.get("resolved_username")
+            original = identity.get("original_username")
+            if original and original != log_name:
+                logger.info(
+                    "Dedotto %s %s per %s (alias %s) nella missione %s",
+                    cost,
+                    "Oro" if mission_type == "Gold" else "Gem",
+                    log_name,
+                    original,
+                    mission_id,
+                )
+            else:
+                logger.info(
+                    "Dedotto %s %s per %s nella missione %s",
+                    cost,
+                    "Oro" if mission_type == "Gold" else "Gem",
+                    log_name,
+                    mission_id,
+                )
+    else:
+        logger.info(
+            "Missione attiva %s registrata senza costi aggiuntivi.",
+            mission_id,
+        )
 
     metadata = {
         "tier_start_time": tier_start_time,
-        "participant_count": count,
+        "participants_count": len(raw_usernames),
+        "resolved_participants_count": participant_count,
         "alias_resolutions": alias_resolved_count,
         "linked_participants": sum(
             1 for identity in resolved_identities if identity.get("telegram_id")
         ),
+        "cost_applied": cost,
     }
+    if unresolved_usernames:
+        metadata["unresolved_participants"] = unresolved_usernames
+        metadata["unresolved_participants_count"] = len(unresolved_usernames)
+    else:
+        metadata["unresolved_participants_count"] = 0
 
     participant_entries: List[Dict[str, Any]] = []
     for identity in resolved_identities:
@@ -801,12 +796,7 @@ async def process_active_mission_auto():
         mission_id,
         mission_type,
         participant_entries,
-    }
-
-    event_id = await db_manager.log_mission_participation(
-        mission_id,
-        mission_type,
-        usernames,
+        raw_usernames,
         cost_per_participant=cost,
         outcome="auto_processed",
         source="active_mission",
@@ -817,8 +807,9 @@ async def process_active_mission_auto():
     logger.info(
         "Missione %s processata e registrata (event_id=%s).",
         mission_id,
-        event_id,
+        event_id or "N/A",
     )
+
 
 # =============================================================================
 # FUNZIONI HELPER PER FSM E GESTIONE MESSAGGI DI MODIFICA
