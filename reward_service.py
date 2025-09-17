@@ -1,9 +1,9 @@
-from datetime import datetime, timedelta
-from typing import Dict, List
-import asyncio
+from typing import Dict, List, Optional
+
+from services.db_manager import MongoManager
 
 class RewardService:
-    def __init__(self, db_manager):
+    def __init__(self, db_manager: MongoManager):
         self.db = db_manager
         
         # Configurazione punti
@@ -23,33 +23,66 @@ class RewardService:
             "CLAN_LEGEND": {"points": 100, "name": "Leggenda del Clan", "icon": "👑"}
         }
         
-    async def award_points(self, username: str, point_type: str, amount: int = None):
+    async def award_points(
+        self, username: str, point_type: str, amount: Optional[int] = None
+    ) -> int:
         """Assegna punti a un utente"""
+        safe_amount = max(amount or 0, 0)
+
+        canonical_username = (username or "").strip()
+        if not canonical_username:
+            return 0
+
+        try:
+            resolution = await self.db.resolve_profile_by_game_alias(canonical_username)
+        except Exception:
+            resolution = None
+
+        if resolution and resolution.get("resolved_username"):
+            canonical_username = resolution.get("resolved_username")
+
         if point_type == "DONATION_ORO":
-            points = max(1, amount // 1000) * self.POINTS_CONFIG["DONATION_ORO"]
+            base_units = safe_amount // 1000
+            if safe_amount > 0:
+                base_units = max(1, base_units)
+            points = base_units * self.POINTS_CONFIG["DONATION_ORO"]
         elif point_type == "DONATION_GEM":
-            points = max(1, amount // 1000) * self.POINTS_CONFIG["DONATION_GEM"]
+            base_units = safe_amount // 1000
+            if safe_amount > 0:
+                base_units = max(1, base_units)
+            points = base_units * self.POINTS_CONFIG["DONATION_GEM"]
         else:
             points = self.POINTS_CONFIG.get(point_type, 0)
-            
+
+        if points <= 0:
+            return 0
+
         # Aggiorna database
-        await self.db.users_col.update_one(
-            {"username": username},
-            {"$inc": {"reward_points": points}},
-            upsert=True
-        )
-        
+        await self.db.increment_reward_points(canonical_username, points)
+
         # Controlla achievement
-        await self.check_achievements(username)
-        
+        await self.check_achievements(canonical_username)
+
         return points
         
     async def check_achievements(self, username: str):
         """Controlla se l'utente ha sbloccato achievement"""
-        user_data = await self.db.users_col.find_one({"username": username})
+        target_username = (username or "").strip()
+        if not target_username:
+            return []
+
+        user_data = await self.db.fetch_user(target_username)
         if not user_data:
-            return
-            
+            try:
+                resolution = await self.db.resolve_profile_by_game_alias(target_username)
+            except Exception:
+                resolution = None
+            if resolution and resolution.get("resolved_username"):
+                target_username = resolution.get("resolved_username")
+                user_data = await self.db.fetch_user(target_username)
+        if not user_data:
+            return []
+
         donazioni = user_data.get("donazioni", {})
         total_oro = donazioni.get("Oro", 0)
         total_gem = donazioni.get("Gem", 0)
@@ -67,11 +100,8 @@ class RewardService:
             
         # Aggiorna database con nuovi achievement
         if new_achievements:
-            await self.db.users_col.update_one(
-                {"username": username},
-                {"$addToSet": {"achievements": {"$each": new_achievements}}}
-            )
-            
+            await self.db.add_achievements(target_username, new_achievements)
+
         return new_achievements
         
     async def get_leaderboard(self, limit: int = 10) -> List[Dict]:
@@ -82,5 +112,5 @@ class RewardService:
             {"$limit": limit}
         ]
         
-        leaderboard = await self.db.users_col.aggregate(pipeline).to_list(length=None)
+        leaderboard = await self.db.aggregate_users(pipeline)
         return leaderboard
