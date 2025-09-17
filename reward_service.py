@@ -87,6 +87,23 @@ class RewardService:
         total_oro = donazioni.get("Oro", 0)
         total_gem = donazioni.get("Gem", 0)
         current_achievements = user_data.get("achievements", [])
+        await self.db.increment_reward_points(username, points)
+
+        # Controlla achievement
+        await self.check_achievements(username)
+
+        return points
+        
+    async def check_achievements(self, username: str):
+        """Controlla se l'utente ha sbloccato achievement"""
+        user_data = await self.db.fetch_user(username)
+        if not user_data:
+            return []
+            
+        donazioni = user_data.get("donazioni", {})
+        total_oro = donazioni.get("Oro", 0)
+        total_gem = donazioni.get("Gem", 0)
+        current_achievements = user_data.get("achievements", [])
         
         new_achievements = []
         
@@ -101,6 +118,7 @@ class RewardService:
         # Aggiorna database con nuovi achievement
         if new_achievements:
             await self.db.add_achievements(target_username, new_achievements)
+            await self.db.add_achievements(username, new_achievements)
 
         return new_achievements
         

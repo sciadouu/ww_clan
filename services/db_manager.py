@@ -298,6 +298,7 @@ class MongoManager:
         mission_id: Optional[str],
         mission_type: str,
         participants: Sequence[Any],
+        participants: Sequence[str],
         *,
         cost_per_participant: int,
         outcome: str = "processed",
@@ -349,6 +350,14 @@ class MongoManager:
         if not participant_entries:
             return None
 
+        if not participants:
+            return None
+
+        processed_time = occurred_at or datetime.now(timezone.utc)
+        event_id = f"{mission_id or 'mission'}-{uuid4()}"
+        participant_entries = [
+            {"username": username, "cost": cost_per_participant} for username in participants
+        ]
         document: Dict[str, Any] = {
             "_id": event_id,
             "mission_id": mission_id,
@@ -359,6 +368,11 @@ class MongoManager:
             "source": source,
             "cost_per_participant": cost_per_participant,
             "total_cost": cost_per_participant * len(participant_entries),
+            "participant_count": len(participants),
+            "outcome": outcome,
+            "source": source,
+            "cost_per_participant": cost_per_participant,
+            "total_cost": cost_per_participant * len(participants),
             "processed_at": processed_time,
         }
         if metadata:

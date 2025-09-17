@@ -553,6 +553,35 @@ async def process_mission(
         return None
 
     participant_count = len(resolved_identities)
+                    await db_manager.log_donation(
+                        record_id,
+                        username,
+                        gold_amount,
+                        gems_amount,
+                        raw_record=record,
+                    )
+
+                # Segna questo record come "già processato"
+                await db_manager.mark_ledger_processed(record_id, raw_record=record)
+
+async def process_mission(
+    participants: List[str],
+    mission_type: str,
+    *,
+    mission_id: Optional[str] = None,
+    outcome: str = "processed",
+    source: str = "manual",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Processa una missione, applica i costi e registra la partecipazione nel database."""
+
+    if not participants:
+        logger.info("Processo missione %s saltato: nessun partecipante fornito.", mission_type)
+        return None
+
+    mission_type = mission_type or "Unknown"
+    mission_type_lower = mission_type.lower()
+    participant_count = len(participants)
     cost = 0
     currency_key = mission_type
 
@@ -571,6 +600,8 @@ async def process_mission(
     if cost != 0:
         for identity in resolved_identities:
             await update_user_balance(identity["resolved_username"], currency_key, -cost)
+        for user in participants:
+            await update_user_balance(user, currency_key, -cost)
         logger.info(
             "Applicato costo di %s %s a %s partecipanti (missione %s).",
             cost,
@@ -620,6 +651,7 @@ async def process_mission(
         mission_id,
         mission_type,
         participant_entries,
+        participants,
         cost_per_participant=cost,
         outcome=outcome,
         source=source,
@@ -769,6 +801,12 @@ async def process_active_mission_auto():
         mission_id,
         mission_type,
         participant_entries,
+    }
+
+    event_id = await db_manager.log_mission_participation(
+        mission_id,
+        mission_type,
+        usernames,
         cost_per_participant=cost,
         outcome="auto_processed",
         source="active_mission",
