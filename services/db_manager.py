@@ -690,7 +690,13 @@ class MongoManager:
             update_doc["verification"] = verification_payload
             push_ops["verification_history"] = verification_payload
 
-        update_operations: Dict[str, Any] = {"$set": update_doc, "$setOnInsert": set_on_insert}
+        if push_ops:
+            for field in list(push_ops.keys()):
+                set_on_insert.pop(field, None)
+
+        update_operations: Dict[str, Any] = {"$set": update_doc}
+        if set_on_insert:
+            update_operations["$setOnInsert"] = set_on_insert
         if push_ops:
             update_operations["$push"] = {
                 field: {"$each": [value]} for field, value in push_ops.items()
