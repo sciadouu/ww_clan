@@ -30,6 +30,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from services.notification_service import EnhancedNotificationService, NotificationType
+from services.db_manager import MongoManager
 from config import (
     TOKEN,
     WOLVESVILLE_API_KEY,
@@ -95,9 +96,7 @@ DATABASE_NAME = "Wolvesville"
 USERS_COLLECTION = "users"
 
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, tlsAllowInvalidCertificates=True)
-db = mongo_client[DATABASE_NAME]
-users_col = db[USERS_COLLECTION]
-processed_ledger_col = db["processed_ledger"]
+db_manager = MongoManager(mongo_client, DATABASE_NAME)
 
 # Tempo di reset per considerare solo le donazioni future
 RESET_TIME = datetime.now(timezone.utc)
@@ -131,26 +130,24 @@ async def clean_duplicate_users():
     Rimuove utenti duplicati dal database mantenendo solo uno per username.
     """
     try:
-        # Trova tutti gli username duplicati
-        pipeline = [
-            {"$group": {"_id": "$username", "count": {"$sum": 1}, "docs": {"$push": "$_id"}}},
-            {"$match": {"count": {"$gt": 1}}}
-        ]
+        removed_info = await db_manager.remove_duplicate_users()
+        total_removed = sum(item.get("removed", 0) for item in removed_info)
 
-        duplicates = await users_col.aggregate(pipeline).to_list(length=None)
+        for item in removed_info:
+            username = item.get("username", "sconosciuto")
+            removed = item.get("removed", 0)
+            removed_ids = item.get("removed_ids", [])
+            logger.info(
+                "Eliminati %s duplicati per %s (documenti rimossi: %s)",
+                removed,
+                username,
+                removed_ids,
+            )
 
-        for duplicate in duplicates:
-            username = duplicate["_id"]
-            doc_ids = duplicate["docs"]
-
-            # Mantieni solo il primo documento, elimina gli altri
-            docs_to_delete = doc_ids[1:]  # Salta il primo
-
-            for doc_id in docs_to_delete:
-                await users_col.delete_one({"_id": doc_id})
-                logger.info(f"Eliminato documento duplicato per {username}")
-
-        logger.info(f"Pulizia duplicati completata. Eliminati {len(duplicates)} duplicati.")
+        logger.info(
+            "Pulizia duplicati completata. Eliminati %s duplicati.",
+            total_removed,
+        )
 
     except Exception as e:
         logger.error(f"Errore durante pulizia duplicati: {e}")
@@ -180,7 +177,7 @@ async def check_clan_departures():
                 current_usernames.add(username)
 
         # Ottieni tutti gli utenti nel database
-        db_users = await users_col.find({}).to_list(length=None)
+        db_users = await db_manager.list_users()
 
         users_removed = 0
         debt_notifications = 0
@@ -226,8 +223,8 @@ async def check_clan_departures():
 
             else:
                 # Nessun debito, elimina dal database
-                result = await users_col.delete_one({"username": username})
-                if result.deleted_count > 0:
+                removed = await db_manager.remove_user_by_username(username)
+                if removed > 0:
                     users_removed += 1
                     logger.info(f"Utente {username} rimosso dal database (nessun debito)")
 
@@ -258,15 +255,8 @@ async def prepopulate_users():
                 username = member.get("username")
                 if username:
                     # UPSERT con controllo duplicati migliorato
-                    result = await users_col.update_one(
-                        {"username": username},
-                        {
-                            "$setOnInsert": {"donazioni": {"Oro": 0, "Gem": 0}},
-                            "$set": {"username": username}  # Assicura che username sia sempre presente
-                        },
-                        upsert=True
-                    )
-                    if result.upserted_id:
+                    inserted = await db_manager.ensure_user(username)
+                    if inserted:
                         logger.info(f"Utente {username} pre-popolato con bilancio 0.")
 
 
@@ -277,19 +267,7 @@ async def update_user_balance(username: str, currency: str, amount: int):
     mentre se è "gem" viene usato "Gem". In questo modo si evita di creare campi
     duplicati (es. "Gold") e si mantiene il DB con soli due campi: Oro e Gem.
     """
-    if currency.lower() == "gold":
-        normalized_currency = "Oro"
-    elif currency.lower() == "gem":
-        normalized_currency = "Gem"
-    else:
-        normalized_currency = currency.capitalize()
-
-    field = f"donazioni.{normalized_currency}"
-    await users_col.update_one(
-        {"username": username},
-        {"$inc": {field: amount}, "$setOnInsert": {"username": username}},
-        upsert=True
-    )
+    normalized_currency = await db_manager.update_user_balance(username, currency, amount)
     logger.info(f"Aggiornato bilancio per {username}: {normalized_currency} += {amount}")
 
 
@@ -317,8 +295,7 @@ async def process_ledger():
                     continue
 
                 # Verifica se abbiamo già processato questo record
-                already_processed = await processed_ledger_col.find_one({"_id": record_id})
-                if already_processed:
+                if await db_manager.has_processed_ledger(record_id):
                     # Significa che l'abbiamo già gestito, quindi skip
                     continue
 
@@ -336,24 +313,90 @@ async def process_ledger():
                     if gems_amount > 0:
                         await update_user_balance(username, "Gem", gems_amount)
 
-                # Segna questo record come "già processato"
-                await processed_ledger_col.insert_one({"_id": record_id})
+                    await db_manager.log_donation(
+                        record_id,
+                        username,
+                        gold_amount,
+                        gems_amount,
+                        raw_record=record,
+                    )
 
-async def process_mission(participants: List[str], mission_type: str):
-    """
-    Processa le missioni e applica il costo appropriato (deduzione dal bilancio) in base al tipo di missione.
-    """
-    if mission_type == "Gold":
+                # Segna questo record come "già processato"
+                await db_manager.mark_ledger_processed(record_id, raw_record=record)
+
+async def process_mission(
+    participants: List[str],
+    mission_type: str,
+    *,
+    mission_id: Optional[str] = None,
+    outcome: str = "processed",
+    source: str = "manual",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Processa una missione, applica i costi e registra la partecipazione nel database."""
+
+    if not participants:
+        logger.info("Processo missione %s saltato: nessun partecipante fornito.", mission_type)
+        return None
+
+    mission_type = mission_type or "Unknown"
+    mission_type_lower = mission_type.lower()
+    participant_count = len(participants)
+    cost = 0
+    currency_key = mission_type
+
+    if mission_type_lower == "gold":
         cost = 500
+        currency_key = "Gold"
+    elif mission_type_lower == "gem":
+        if participant_count > 7:
+            cost = 140
+        elif 5 <= participant_count <= 7:
+            cost = 150
+        else:
+            cost = 0
+        currency_key = "Gem"
+
+    if cost != 0:
         for user in participants:
-            await update_user_balance(user, "Oro", -cost)
-        logger.info(f"Applicato costo di {cost} Oro a {len(participants)} partecipanti (missione Gold).")
-    elif mission_type == "Gem":
-        num = len(participants)
-        cost = 150 if 5 <= num <= 7 else 140 if num > 7 else 0
-        for user in participants:
-            await update_user_balance(user, "Gem", -cost)
-        logger.info(f"Applicato costo di {cost} Gem a {len(participants)} partecipanti (missione Gem).")
+            await update_user_balance(user, currency_key, -cost)
+        logger.info(
+            "Applicato costo di %s %s a %s partecipanti (missione %s).",
+            cost,
+            "Oro" if mission_type_lower == "gold" else "Gem",
+            participant_count,
+            mission_type,
+        )
+    else:
+        logger.info(
+            "Registrata missione %s senza costi aggiuntivi per %s partecipanti.",
+            mission_type,
+            participant_count,
+        )
+
+    metadata_payload = dict(metadata or {})
+    metadata_payload.setdefault("participants_count", participant_count)
+    metadata_payload.setdefault("cost_applied", cost)
+
+    event_id = await db_manager.log_mission_participation(
+        mission_id,
+        mission_type,
+        participants,
+        cost_per_participant=cost,
+        outcome=outcome,
+        source=source,
+        metadata=metadata_payload,
+    )
+
+    if event_id:
+        logger.info(
+            "Registrata partecipazione missione %s (event_id=%s) con %s partecipanti.",
+            mission_id or "manual",
+            event_id,
+            participant_count,
+        )
+
+    return event_id
 
 async def process_active_mission_auto():
     """
@@ -383,9 +426,7 @@ async def process_active_mission_auto():
         logger.error("Missione attiva priva di id o tierStartTime.")
         return
 
-    processed_active_col = db["processed_active_missions"]
-    already_processed = await processed_active_col.find_one({"_id": mission_id})
-    if already_processed:
+    if await db_manager.has_processed_active_mission(mission_id):
         logger.info(f"Missione {mission_id} già processata. Nessuna operazione eseguita.")
         return
 
@@ -412,8 +453,27 @@ async def process_active_mission_auto():
         await update_user_balance(username, mission_type, -cost)
         logger.info(f"Dedotto {cost} {('Oro' if mission_type=='Gold' else 'Gem')} per {username} nella missione {mission_id}")
 
-    await processed_active_col.insert_one({"_id": mission_id, "tierStartTime": tier_start_time})
-    logger.info(f"Missione {mission_id} processata e registrata.")
+    metadata = {
+        "tier_start_time": tier_start_time,
+        "participant_count": count,
+    }
+
+    event_id = await db_manager.log_mission_participation(
+        mission_id,
+        mission_type,
+        usernames,
+        cost_per_participant=cost,
+        outcome="auto_processed",
+        source="active_mission",
+        metadata=metadata,
+    )
+
+    await db_manager.mark_active_mission_processed(mission_id, tier_start_time)
+    logger.info(
+        "Missione %s processata e registrata (event_id=%s).",
+        mission_id,
+        event_id,
+    )
 
 # =============================================================================
 # FUNZIONI HELPER PER FSM E GESTIONE MESSAGGI DI MODIFICA
@@ -1589,16 +1649,15 @@ async def enable_votes_callback(callback: types.CallbackQuery, state: FSMContext
 """BILANCI """
 @dp.message(Command("balances"))
 async def show_balances(message: types.Message):
-    cursor = users_col.find({})
+    users = await db_manager.list_users()
     logger.info("Sto per costruire la tabella bilanci. Ecco i documenti dal DB:")
-    # Logga i doc
-    async for doc in users_col.find({}):
+    for doc in users:
         logger.info(f"Doc utente: {doc}")
     lines = []
     lines.append("Utente           Oro     Gem")
     lines.append("-----------------------------")
 
-    async for doc in cursor:
+    for doc in users:
         username = doc.get("username", "Sconosciuto")
         donazioni = doc.get("donazioni", {})
         oro = donazioni.get("Oro", 0)
@@ -1845,8 +1904,8 @@ async def modify_start(callback: types.CallbackQuery, state: FSMContext):
 
     try:
         players = []
-        cursor = users_col.find({})
-        async for doc in cursor:
+        users = await db_manager.list_users()
+        for doc in users:
             username = doc.get("username", "Sconosciuto")
             if username != "Sconosciuto":  # Filtra username validi
                 players.append(username)
@@ -1961,14 +2020,8 @@ async def modify_enter_amount(message: types.Message, state: FSMContext):
             await state.clear()
             return
 
-        field_name = f"donazioni.{db_key}"
-
         # Aggiorna il DB
-        await users_col.update_one(
-            {"username": username},
-            {"$set": {field_name: new_amount}},
-            upsert=True
-        )
+        await db_manager.set_user_currency(username, db_key, new_amount)
 
         msg = await message.answer(
             f"✅ {currency} di <b>{username}</b> aggiornato a: <b>{new_amount:,}</b>",
