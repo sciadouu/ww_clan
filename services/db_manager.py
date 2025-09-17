@@ -297,8 +297,8 @@ class MongoManager:
         self,
         mission_id: Optional[str],
         mission_type: str,
-        participants: Sequence[Any],
-        participants: Sequence[str],
+        participant_entries: Sequence[Any],
+        raw_participants: Optional[Sequence[str]],
         *,
         cost_per_participant: int,
         outcome: str = "processed",
@@ -308,31 +308,34 @@ class MongoManager:
     ) -> Optional[str]:
         """Registra la partecipazione a una missione in una collezione dedicata."""
 
-        processed_time = occurred_at or datetime.now(timezone.utc)
-        event_id = f"{mission_id or 'mission'}-{uuid4()}"
-        participant_entries: List[Dict[str, Any]] = []
-        for participant in participants:
+        normalized_participants: List[Dict[str, Any]] = []
+        for participant in participant_entries:
             entry: Dict[str, Any]
             if isinstance(participant, dict):
                 username_value = (participant.get("username") or "").strip()
                 if not username_value:
                     continue
                 entry = {"username": username_value, "cost": cost_per_participant}
-                original_username = participant.get("original_username")
+
+                original_username = (participant.get("original_username") or "").strip()
                 if original_username:
                     entry["original_username"] = original_username
+
                 telegram_id = participant.get("telegram_id")
                 if telegram_id is not None:
                     try:
                         entry["telegram_id"] = int(telegram_id)
                     except (TypeError, ValueError):
                         pass
+
                 telegram_username = participant.get("telegram_username")
                 if telegram_username:
                     entry["telegram_username"] = telegram_username
-                match_source = participant.get("match")
+
+                match_source = participant.get("match") or participant.get("identity_match")
                 if match_source:
                     entry["identity_match"] = match_source
+
                 profile_snapshot = participant.get("profile_snapshot")
                 if profile_snapshot:
                     entry["profile_snapshot"] = profile_snapshot
@@ -345,38 +348,32 @@ class MongoManager:
                     "original_username": username_value,
                     "cost": cost_per_participant,
                 }
-            participant_entries.append(entry)
 
-        if not participant_entries:
-            return None
+            normalized_participants.append(entry)
 
-        if not participants:
+        if not normalized_participants:
             return None
 
         processed_time = occurred_at or datetime.now(timezone.utc)
         event_id = f"{mission_id or 'mission'}-{uuid4()}"
-        participant_entries = [
-            {"username": username, "cost": cost_per_participant} for username in participants
-        ]
         document: Dict[str, Any] = {
             "_id": event_id,
             "mission_id": mission_id,
             "mission_type": mission_type,
-            "participants": participant_entries,
-            "participant_count": len(participant_entries),
+            "participants": normalized_participants,
+            "participant_count": len(normalized_participants),
             "outcome": outcome,
             "source": source,
             "cost_per_participant": cost_per_participant,
-            "total_cost": cost_per_participant * len(participant_entries),
-            "participant_count": len(participants),
-            "outcome": outcome,
-            "source": source,
-            "cost_per_participant": cost_per_participant,
-            "total_cost": cost_per_participant * len(participants),
+            "total_cost": cost_per_participant * len(normalized_participants),
             "processed_at": processed_time,
         }
+
         if metadata:
             document["metadata"] = metadata
+
+        if raw_participants:
+            document["raw_participants"] = list(raw_participants)
 
         result = await self.missions_history_col.insert_one(document)
         return str(result.inserted_id)
