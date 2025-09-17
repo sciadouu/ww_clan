@@ -58,7 +58,7 @@ class BotErrorHandler:
             "error_type": type(error).__name__,
             "error_message": str(error),
             "timestamp": datetime.now().isoformat(),
-            **context if context else {}
+            **(context or {})
         }
         
         # Gestione specifica per tipo di errore

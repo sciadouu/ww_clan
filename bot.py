@@ -70,6 +70,8 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+notification_service: Optional[EnhancedNotificationService] = None
+
 LOG_PUBLIC_IP = os.getenv("LOG_PUBLIC_IP", "false").lower() in {"1", "true", "yes", "on"}
 
 
@@ -100,6 +102,47 @@ def format_telegram_username(username: Optional[str]) -> str:
     if not cleaned:
         return "—"
     return cleaned if cleaned.startswith("@") else f"@{cleaned}"
+
+
+def format_markdown_code(value: Optional[Any]) -> str:
+    """Formatta un valore come blocco inline oppure restituisce un segnaposto."""
+
+    if value is None:
+        return "—"
+    text = str(value).strip()
+    if not text or text == "—":
+        return "—"
+    safe = text.replace("`", "\\`")
+    return f"`{safe}`"
+
+
+def schedule_admin_notification(
+    message: str,
+    *,
+    notification_type: NotificationType = NotificationType.INFO,
+    urgent: bool = False,
+) -> None:
+    """Invia una notifica agli admin senza bloccare il flusso principale."""
+
+    if not notification_service:
+        return
+
+    async def _send() -> None:
+        try:
+            await notification_service.send_admin_notification(
+                message,
+                notification_type=notification_type,
+                urgent=urgent,
+            )
+        except Exception as exc:  # pragma: no cover - solo logging
+            logger.warning("Notifica admin fallita: %s", exc)
+
+    try:
+        asyncio.create_task(_send())
+    except RuntimeError:
+        logger.warning(
+            "Loop asyncio non attivo: impossibile pianificare la notifica admin immediatamente."
+        )
 
 
 def build_profile_snapshot(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -209,7 +252,6 @@ async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
 
     if (
         result.get("telegram_username_changed")
-        and notification_service
         and result.get("profile")
     ):
         profile = result["profile"]
@@ -219,18 +261,15 @@ async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
         old_username = format_telegram_username(result.get("previous_telegram_username"))
         new_username = format_telegram_username(profile.get("telegram_username"))
         message = (
-            "♻️ <b>Aggiornamento username Telegram</b>\n\n"
-            f"🎮 <b>Giocatore:</b> {game_username}\n"
-            f"🆔 <b>Telegram ID:</b> <code>{profile.get('telegram_id')}</code>\n"
-            f"🔁 <b>Username:</b> {old_username} → {new_username}"
+            "♻️ **Aggiornamento username Telegram**\n\n"
+            f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
+            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
+            f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
         )
-        try:
-            await notification_service.send_admin_notification(
-                message,
-                notification_type=NotificationType.INFO,
-            )
-        except Exception as exc:  # pragma: no cover - log esterno
-            logger.warning("Notifica cambio username Telegram fallita: %s", exc)
+        schedule_admin_notification(
+            message,
+            notification_type=NotificationType.INFO,
+        )
 
 # =============================================================================
 # CONFIGURAZIONE DI MONGODB
@@ -241,8 +280,6 @@ USERS_COLLECTION = "users"
 
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, tlsAllowInvalidCertificates=True)
 db_manager = MongoManager(mongo_client, DATABASE_NAME)
-
-notification_service: Optional[EnhancedNotificationService] = None
 
 # Tempo di reset per considerare solo le donazioni future
 RESET_TIME = datetime.now(timezone.utc)
@@ -522,6 +559,8 @@ async def process_mission(
 
     resolved_identities: List[Dict[str, Any]] = []
     alias_resolved_count = 0
+    unresolved_participants: List[str] = []
+
     for participant in participants:
         identity = await resolve_member_identity(participant)
         resolved_username = identity.get("resolved_username")
@@ -531,6 +570,7 @@ async def process_mission(
                 mission_type,
                 participant,
             )
+            unresolved_participants.append(participant)
             continue
         if (
             identity.get("match") == "history"
@@ -548,40 +588,15 @@ async def process_mission(
 
     if not resolved_identities:
         logger.info(
-            "Processo missione %s saltato: nessun partecipante risolto.", mission_type
+            "Processo missione %s saltato: nessun partecipante risolto.",
+            mission_type,
         )
         return None
 
+    original_participant_count = len(participants)
     participant_count = len(resolved_identities)
-                    await db_manager.log_donation(
-                        record_id,
-                        username,
-                        gold_amount,
-                        gems_amount,
-                        raw_record=record,
-                    )
+    unresolved_count = max(original_participant_count - participant_count, 0)
 
-                # Segna questo record come "già processato"
-                await db_manager.mark_ledger_processed(record_id, raw_record=record)
-
-async def process_mission(
-    participants: List[str],
-    mission_type: str,
-    *,
-    mission_id: Optional[str] = None,
-    outcome: str = "processed",
-    source: str = "manual",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    """Processa una missione, applica i costi e registra la partecipazione nel database."""
-
-    if not participants:
-        logger.info("Processo missione %s saltato: nessun partecipante fornito.", mission_type)
-        return None
-
-    mission_type = mission_type or "Unknown"
-    mission_type_lower = mission_type.lower()
-    participant_count = len(participants)
     cost = 0
     currency_key = mission_type
 
@@ -600,8 +615,6 @@ async def process_mission(
     if cost != 0:
         for identity in resolved_identities:
             await update_user_balance(identity["resolved_username"], currency_key, -cost)
-        for user in participants:
-            await update_user_balance(user, currency_key, -cost)
         logger.info(
             "Applicato costo di %s %s a %s partecipanti (missione %s).",
             cost,
@@ -623,13 +636,16 @@ async def process_mission(
         )
 
     metadata_payload = dict(metadata or {})
-    metadata_payload.setdefault("participants_count", participant_count)
+    metadata_payload.setdefault("participants_count", original_participant_count)
     metadata_payload.setdefault("cost_applied", cost)
     metadata_payload["resolved_participants_count"] = participant_count
+    metadata_payload["unresolved_participants_count"] = unresolved_count
     metadata_payload["alias_resolutions"] = alias_resolved_count
     metadata_payload["linked_participants"] = sum(
         1 for identity in resolved_identities if identity.get("telegram_id")
     )
+    if unresolved_participants:
+        metadata_payload["unresolved_participants"] = unresolved_participants
 
     participant_entries: List[Dict[str, Any]] = []
     for identity in resolved_identities:
@@ -667,6 +683,7 @@ async def process_mission(
         )
 
     return event_id
+
 
 async def process_active_mission_auto():
     """
@@ -709,6 +726,7 @@ async def process_active_mission_auto():
 
     resolved_identities: List[Dict[str, Any]] = []
     alias_resolved_count = 0
+    unresolved_usernames: List[str] = []
     for username in raw_usernames:
         identity = await resolve_member_identity(username)
         resolved_username = identity.get("resolved_username")
@@ -718,6 +736,7 @@ async def process_active_mission_auto():
                 mission_id,
                 username,
             )
+            unresolved_usernames.append(username)
             continue
         if (
             identity.get("match") == "history"
@@ -737,49 +756,62 @@ async def process_active_mission_auto():
         logger.info("Missione %s: nessun partecipante valido dopo la risoluzione.", mission_id)
         return
 
-    count = len(resolved_identities)
+    participant_count = len(resolved_identities)
 
     mission_type = "Gem" if quest.get("purchasableWithGems", False) else "Gold"
     if mission_type == "Gold":
         cost = 500
     else:
-        if 5 <= count <= 7:
-            cost = 150
-        elif count > 7:
+        if participant_count > 7:
             cost = 140
+        elif 5 <= participant_count <= 7:
+            cost = 150
         else:
             cost = 0
 
-    for identity in resolved_identities:
-        await update_user_balance(identity["resolved_username"], mission_type, -cost)
-        log_name = identity.get("resolved_username")
-        original = identity.get("original_username")
-        if original and original != log_name:
-            logger.info(
-                "Dedotto %s %s per %s (alias %s) nella missione %s",
-                cost,
-                "Oro" if mission_type == "Gold" else "Gem",
-                log_name,
-                original,
-                mission_id,
-            )
-        else:
-            logger.info(
-                "Dedotto %s %s per %s nella missione %s",
-                cost,
-                "Oro" if mission_type == "Gold" else "Gem",
-                log_name,
-                mission_id,
-            )
+    if cost:
+        for identity in resolved_identities:
+            await update_user_balance(identity["resolved_username"], mission_type, -cost)
+            log_name = identity.get("resolved_username")
+            original = identity.get("original_username")
+            if original and original != log_name:
+                logger.info(
+                    "Dedotto %s %s per %s (alias %s) nella missione %s",
+                    cost,
+                    "Oro" if mission_type == "Gold" else "Gem",
+                    log_name,
+                    original,
+                    mission_id,
+                )
+            else:
+                logger.info(
+                    "Dedotto %s %s per %s nella missione %s",
+                    cost,
+                    "Oro" if mission_type == "Gold" else "Gem",
+                    log_name,
+                    mission_id,
+                )
+    else:
+        logger.info(
+            "Missione attiva %s registrata senza costi aggiuntivi.",
+            mission_id,
+        )
 
     metadata = {
         "tier_start_time": tier_start_time,
-        "participant_count": count,
+        "participants_count": len(raw_usernames),
+        "resolved_participants_count": participant_count,
         "alias_resolutions": alias_resolved_count,
         "linked_participants": sum(
             1 for identity in resolved_identities if identity.get("telegram_id")
         ),
+        "cost_applied": cost,
     }
+    if unresolved_usernames:
+        metadata["unresolved_participants"] = unresolved_usernames
+        metadata["unresolved_participants_count"] = len(unresolved_usernames)
+    else:
+        metadata["unresolved_participants_count"] = 0
 
     participant_entries: List[Dict[str, Any]] = []
     for identity in resolved_identities:
@@ -801,12 +833,7 @@ async def process_active_mission_auto():
         mission_id,
         mission_type,
         participant_entries,
-    }
-
-    event_id = await db_manager.log_mission_participation(
-        mission_id,
-        mission_type,
-        usernames,
+        raw_usernames,
         cost_per_participant=cost,
         outcome="auto_processed",
         source="active_mission",
@@ -817,8 +844,9 @@ async def process_active_mission_auto():
     logger.info(
         "Missione %s processata e registrata (event_id=%s).",
         mission_id,
-        event_id,
+        event_id or "N/A",
     )
+
 
 # =============================================================================
 # FUNZIONI HELPER PER FSM E GESTIONE MESSAGGI DI MODIFICA
@@ -1169,10 +1197,10 @@ async def bot_kicked_from_chat(event: ChatMemberUpdated):
             f"🆔 **Chat ID:** `{chat_id}`\n\n"
             f"🔄 **Azione:** Verificare se l'uscita è intenzionale"
         )
-        await notification_service.send_admin_notification(
+        schedule_admin_notification(
             message,
             notification_type=NotificationType.WARNING,
-            urgent=True
+            urgent=True,
         )
 
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
@@ -1776,44 +1804,42 @@ async def finalize_profile_link(callback: types.CallbackQuery, state: FSMContext
 
     await callback.answer("Profilo verificato!", show_alert=False)
 
-    if notification_service:
-        admin_lines = [
-            "🔗 <b>Profilo Wolvesville collegato</b>",
-            f"🎮 <b>Username:</b> {profile.get('game_username', username)}",
-            f"🆔 <b>Wolvesville ID:</b> {profile.get('wolvesville_id', '—')}",
-            f"💬 <b>Telegram:</b> {telegram_username_display}",
-            f"🆔 <b>Telegram ID:</b> <code>{profile.get('telegram_id')}</code>",
-        ]
-        if result.get("created"):
-            admin_lines.append("✨ Nuovo collegamento creato.")
-        if result.get("game_username_changed") and result.get("previous_game_username"):
-            admin_lines.append(
-                "🔁 Username di gioco aggiornato: "
-                f"{result['previous_game_username']} → {profile.get('game_username')}"
-            )
-        if result.get("telegram_username_changed"):
-            admin_lines.append(
-                "📛 Username Telegram aggiornato: "
-                f"{format_telegram_username(result.get('previous_telegram_username'))} → {telegram_username_display}"
-            )
-        migrate_result = result.get("migrate_result") or {}
-        if migrate_result.get("status") and migrate_result.get("status") != "unchanged":
-            admin_lines.append(
-                f"🗃️ Migrazione dati utenti: {migrate_result.get('status')}"
-            )
-        verification_payload = result.get("verification")
-        if verification_payload:
-            admin_lines.append(
-                "🔐 Verifica completata via "
-                f"{verification_payload.get('method', 'sconosciuta')}"
-            )
-        try:
-            await notification_service.send_admin_notification(
-                "\n".join(admin_lines),
-                notification_type=NotificationType.SUCCESS,
-            )
-        except Exception as exc:
-            logger.warning("Impossibile inviare la notifica di collegamento: %s", exc)
+    admin_lines = [
+        "🔗 **Profilo Wolvesville collegato**",
+        f"🎮 **Username:** {format_markdown_code(profile.get('game_username', username))}",
+        f"🆔 **Wolvesville ID:** {format_markdown_code(profile.get('wolvesville_id'))}",
+        f"💬 **Telegram:** {format_markdown_code(telegram_username_display)}",
+        f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}",
+    ]
+    if result.get("created"):
+        admin_lines.append("✨ Nuovo collegamento creato.")
+    if result.get("game_username_changed") and result.get("previous_game_username"):
+        admin_lines.append(
+            "🔁 **Username di gioco aggiornato:** "
+            f"{format_markdown_code(result['previous_game_username'])} → {format_markdown_code(profile.get('game_username'))}"
+        )
+    if result.get("telegram_username_changed"):
+        admin_lines.append(
+            "📛 **Username Telegram aggiornato:** "
+            f"{format_markdown_code(format_telegram_username(result.get('previous_telegram_username')))} → {format_markdown_code(telegram_username_display)}"
+        )
+    migrate_result = result.get("migrate_result") or {}
+    migrate_status = migrate_result.get("status")
+    if migrate_status and migrate_status != "unchanged":
+        admin_lines.append(
+            f"🗃️ **Migrazione dati utenti:** {format_markdown_code(migrate_status)}"
+        )
+    verification_payload = result.get("verification")
+    if verification_payload:
+        method = verification_payload.get("method", "sconosciuta")
+        admin_lines.append(
+            f"🔐 **Verifica completata via:** {format_markdown_code(method)}"
+        )
+
+    schedule_admin_notification(
+        "\n".join(admin_lines),
+        notification_type=NotificationType.SUCCESS,
+    )
 
 
 # =============================================================================
