@@ -318,6 +318,26 @@ async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
         return
 
     handle_telegram_sync_result(result)
+    if (
+        result.get("telegram_username_changed")
+        and result.get("profile")
+    ):
+        profile = result["profile"]
+        game_username = profile.get("game_username")
+        if not game_username:
+            return
+        old_username = format_telegram_username(result.get("previous_telegram_username"))
+        new_username = format_telegram_username(profile.get("telegram_username"))
+        message = (
+            "♻️ **Aggiornamento username Telegram**\n\n"
+            f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
+            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
+            f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
+        )
+        schedule_admin_notification(
+            message,
+            notification_type=NotificationType.INFO,
+        )
 
 # =============================================================================
 # CONFIGURAZIONE DI MONGODB
