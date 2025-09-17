@@ -70,6 +70,8 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+notification_service: Optional[EnhancedNotificationService] = None
+
 LOG_PUBLIC_IP = os.getenv("LOG_PUBLIC_IP", "false").lower() in {"1", "true", "yes", "on"}
 
 
@@ -100,6 +102,47 @@ def format_telegram_username(username: Optional[str]) -> str:
     if not cleaned:
         return "—"
     return cleaned if cleaned.startswith("@") else f"@{cleaned}"
+
+
+def format_markdown_code(value: Optional[Any]) -> str:
+    """Formatta un valore come blocco inline oppure restituisce un segnaposto."""
+
+    if value is None:
+        return "—"
+    text = str(value).strip()
+    if not text or text == "—":
+        return "—"
+    safe = text.replace("`", "\\`")
+    return f"`{safe}`"
+
+
+def schedule_admin_notification(
+    message: str,
+    *,
+    notification_type: NotificationType = NotificationType.INFO,
+    urgent: bool = False,
+) -> None:
+    """Invia una notifica agli admin senza bloccare il flusso principale."""
+
+    if not notification_service:
+        return
+
+    async def _send() -> None:
+        try:
+            await notification_service.send_admin_notification(
+                message,
+                notification_type=notification_type,
+                urgent=urgent,
+            )
+        except Exception as exc:  # pragma: no cover - solo logging
+            logger.warning("Notifica admin fallita: %s", exc)
+
+    try:
+        asyncio.create_task(_send())
+    except RuntimeError:
+        logger.warning(
+            "Loop asyncio non attivo: impossibile pianificare la notifica admin immediatamente."
+        )
 
 
 def build_profile_snapshot(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -209,7 +252,6 @@ async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
 
     if (
         result.get("telegram_username_changed")
-        and notification_service
         and result.get("profile")
     ):
         profile = result["profile"]
@@ -219,18 +261,15 @@ async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
         old_username = format_telegram_username(result.get("previous_telegram_username"))
         new_username = format_telegram_username(profile.get("telegram_username"))
         message = (
-            "♻️ <b>Aggiornamento username Telegram</b>\n\n"
-            f"🎮 <b>Giocatore:</b> {game_username}\n"
-            f"🆔 <b>Telegram ID:</b> <code>{profile.get('telegram_id')}</code>\n"
-            f"🔁 <b>Username:</b> {old_username} → {new_username}"
+            "♻️ **Aggiornamento username Telegram**\n\n"
+            f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
+            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
+            f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
         )
-        try:
-            await notification_service.send_admin_notification(
-                message,
-                notification_type=NotificationType.INFO,
-            )
-        except Exception as exc:  # pragma: no cover - log esterno
-            logger.warning("Notifica cambio username Telegram fallita: %s", exc)
+        schedule_admin_notification(
+            message,
+            notification_type=NotificationType.INFO,
+        )
 
 # =============================================================================
 # CONFIGURAZIONE DI MONGODB
@@ -241,8 +280,6 @@ USERS_COLLECTION = "users"
 
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, tlsAllowInvalidCertificates=True)
 db_manager = MongoManager(mongo_client, DATABASE_NAME)
-
-notification_service: Optional[EnhancedNotificationService] = None
 
 # Tempo di reset per considerare solo le donazioni future
 RESET_TIME = datetime.now(timezone.utc)
@@ -1160,10 +1197,10 @@ async def bot_kicked_from_chat(event: ChatMemberUpdated):
             f"🆔 **Chat ID:** `{chat_id}`\n\n"
             f"🔄 **Azione:** Verificare se l'uscita è intenzionale"
         )
-        await notification_service.send_admin_notification(
+        schedule_admin_notification(
             message,
             notification_type=NotificationType.WARNING,
-            urgent=True
+            urgent=True,
         )
 
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
@@ -1767,44 +1804,42 @@ async def finalize_profile_link(callback: types.CallbackQuery, state: FSMContext
 
     await callback.answer("Profilo verificato!", show_alert=False)
 
-    if notification_service:
-        admin_lines = [
-            "🔗 <b>Profilo Wolvesville collegato</b>",
-            f"🎮 <b>Username:</b> {profile.get('game_username', username)}",
-            f"🆔 <b>Wolvesville ID:</b> {profile.get('wolvesville_id', '—')}",
-            f"💬 <b>Telegram:</b> {telegram_username_display}",
-            f"🆔 <b>Telegram ID:</b> <code>{profile.get('telegram_id')}</code>",
-        ]
-        if result.get("created"):
-            admin_lines.append("✨ Nuovo collegamento creato.")
-        if result.get("game_username_changed") and result.get("previous_game_username"):
-            admin_lines.append(
-                "🔁 Username di gioco aggiornato: "
-                f"{result['previous_game_username']} → {profile.get('game_username')}"
-            )
-        if result.get("telegram_username_changed"):
-            admin_lines.append(
-                "📛 Username Telegram aggiornato: "
-                f"{format_telegram_username(result.get('previous_telegram_username'))} → {telegram_username_display}"
-            )
-        migrate_result = result.get("migrate_result") or {}
-        if migrate_result.get("status") and migrate_result.get("status") != "unchanged":
-            admin_lines.append(
-                f"🗃️ Migrazione dati utenti: {migrate_result.get('status')}"
-            )
-        verification_payload = result.get("verification")
-        if verification_payload:
-            admin_lines.append(
-                "🔐 Verifica completata via "
-                f"{verification_payload.get('method', 'sconosciuta')}"
-            )
-        try:
-            await notification_service.send_admin_notification(
-                "\n".join(admin_lines),
-                notification_type=NotificationType.SUCCESS,
-            )
-        except Exception as exc:
-            logger.warning("Impossibile inviare la notifica di collegamento: %s", exc)
+    admin_lines = [
+        "🔗 **Profilo Wolvesville collegato**",
+        f"🎮 **Username:** {format_markdown_code(profile.get('game_username', username))}",
+        f"🆔 **Wolvesville ID:** {format_markdown_code(profile.get('wolvesville_id'))}",
+        f"💬 **Telegram:** {format_markdown_code(telegram_username_display)}",
+        f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}",
+    ]
+    if result.get("created"):
+        admin_lines.append("✨ Nuovo collegamento creato.")
+    if result.get("game_username_changed") and result.get("previous_game_username"):
+        admin_lines.append(
+            "🔁 **Username di gioco aggiornato:** "
+            f"{format_markdown_code(result['previous_game_username'])} → {format_markdown_code(profile.get('game_username'))}"
+        )
+    if result.get("telegram_username_changed"):
+        admin_lines.append(
+            "📛 **Username Telegram aggiornato:** "
+            f"{format_markdown_code(format_telegram_username(result.get('previous_telegram_username')))} → {format_markdown_code(telegram_username_display)}"
+        )
+    migrate_result = result.get("migrate_result") or {}
+    migrate_status = migrate_result.get("status")
+    if migrate_status and migrate_status != "unchanged":
+        admin_lines.append(
+            f"🗃️ **Migrazione dati utenti:** {format_markdown_code(migrate_status)}"
+        )
+    verification_payload = result.get("verification")
+    if verification_payload:
+        method = verification_payload.get("method", "sconosciuta")
+        admin_lines.append(
+            f"🔐 **Verifica completata via:** {format_markdown_code(method)}"
+        )
+
+    schedule_admin_notification(
+        "\n".join(admin_lines),
+        notification_type=NotificationType.SUCCESS,
+    )
 
 
 # =============================================================================
