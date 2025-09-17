@@ -610,7 +610,6 @@ class MongoManager:
                 }
 
         update_doc: Dict[str, Any] = {
-            "telegram_id": telegram_id,
             "game_username": normalized_username,
             "game_username_lower": normalized_lower,
             "updated_at": now,
