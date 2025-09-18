@@ -1,7 +1,7 @@
 """Repository dedicato alla gestione dei punti ricompensa."""
 
 from __future__ import annotations
-
+from dataclasses import dataclass, field
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -25,6 +25,8 @@ class RewardsRepository:
     """Incapsula l'accesso ai dati per il sistema premi."""
 
     db_manager: MongoManager
+    _users: AsyncIOMotorCollection = field(init=False, repr=False)
+    _history: AsyncIOMotorCollection = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._users: AsyncIOMotorCollection = self.db_manager.users_col
