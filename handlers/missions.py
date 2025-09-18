@@ -235,7 +235,6 @@ class MissionHandlers:
                             await callback.message.answer_photo(
                                 photo=input_file,
                                 caption=caption,
-                                message_thread_id=callback.message.message_thread_id,
                             )
                     except Exception as exc:
                         self.logger.warning(
