@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import requests
 import aiohttp
 from PIL import Image
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 # Import di Aiogram
 from aiogram import types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, FSInputFile, Message, ChatMemberUpdated
@@ -35,6 +37,8 @@ from services.mission_service import MissionService
 from services.notification_service import EnhancedNotificationService, NotificationType
 from bot_app import create_app_context
 from bot_app.scheduler import setup_scheduler
+from services.notification_service import EnhancedNotificationService, NotificationType
+from bot_app import create_app_context
 from config import (
     TOKEN,
     WOLVESVILLE_API_KEY,
@@ -195,6 +199,319 @@ class UpdateLoggingMiddleware(BaseMiddleware):
 # =============================================================================
 # FUNZIONI DI ACCESSO AL DATABASE
 # =============================================================================
+
+async def process_mission(
+    participants: List[str],
+    mission_type: str,
+    *,
+    mission_id: Optional[str] = None,
+    outcome: str = "processed",
+    source: str = "manual",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Processa una missione, applica i costi e registra la partecipazione nel database."""
+
+    if not participants:
+        logger.info("Processo missione %s saltato: nessun partecipante fornito.", mission_type)
+        return None
+
+    mission_type = mission_type or "Unknown"
+    mission_type_lower = mission_type.lower()
+
+    resolved_identities: List[Dict[str, Any]] = []
+    alias_resolved_count = 0
+    unresolved_participants: List[str] = []
+
+    for participant in participants:
+        identity = await identity_service.resolve_member_identity(participant)
+        resolved_username = identity.get("resolved_username")
+        if not resolved_username:
+            logger.warning(
+                "Missione %s: ignorato partecipante senza username valido (%s)",
+                mission_type,
+                participant,
+            )
+            unresolved_participants.append(participant)
+            continue
+        if (
+            identity.get("match") == "history"
+            and identity.get("original_username")
+            and identity.get("original_username") != resolved_username
+        ):
+            alias_resolved_count += 1
+            logger.info(
+                "Missione %s: alias risolto %s → %s",
+                mission_type,
+                identity.get("original_username"),
+                resolved_username,
+            )
+        resolved_identities.append(identity)
+
+    if not resolved_identities:
+        logger.info(
+            "Processo missione %s saltato: nessun partecipante risolto.",
+            mission_type,
+        )
+        return None
+
+    original_participant_count = len(participants)
+    participant_count = len(resolved_identities)
+    unresolved_count = max(original_participant_count - participant_count, 0)
+
+    cost = 0
+    currency_key = mission_type
+
+    if mission_type_lower == "gold":
+        cost = 500
+        currency_key = "Gold"
+    elif mission_type_lower == "gem":
+        if participant_count > 7:
+            cost = 140
+        elif 5 <= participant_count <= 7:
+            cost = 150
+        else:
+            cost = 0
+        currency_key = "Gem"
+
+    if cost != 0:
+        for identity in resolved_identities:
+            await maintenance_service.update_user_balance(
+                identity["resolved_username"], currency_key, -cost
+            )
+        logger.info(
+            "Applicato costo di %s %s a %s partecipanti (missione %s).",
+            cost,
+            "Oro" if mission_type_lower == "gold" else "Gem",
+            participant_count,
+            mission_type,
+        )
+        if alias_resolved_count:
+            logger.info(
+                "Missione %s: %s partecipanti provenivano da alias storici.",
+                mission_type,
+                alias_resolved_count,
+            )
+    else:
+        logger.info(
+            "Registrata missione %s senza costi aggiuntivi per %s partecipanti.",
+            mission_type,
+            participant_count,
+        )
+
+    metadata_payload = dict(metadata or {})
+    metadata_payload.setdefault("participants_count", original_participant_count)
+    metadata_payload.setdefault("cost_applied", cost)
+    metadata_payload["resolved_participants_count"] = participant_count
+    metadata_payload["unresolved_participants_count"] = unresolved_count
+    metadata_payload["alias_resolutions"] = alias_resolved_count
+    metadata_payload["linked_participants"] = sum(
+        1 for identity in resolved_identities if identity.get("telegram_id")
+    )
+    if unresolved_participants:
+        metadata_payload["unresolved_participants"] = unresolved_participants
+
+    participant_entries: List[Dict[str, Any]] = []
+    for identity in resolved_identities:
+        entry: Dict[str, Any] = {
+            "username": identity.get("resolved_username"),
+            "original_username": identity.get("original_username"),
+        }
+        if identity.get("telegram_id") is not None:
+            entry["telegram_id"] = identity.get("telegram_id")
+        if identity.get("telegram_username"):
+            entry["telegram_username"] = identity.get("telegram_username")
+        if identity.get("match"):
+            entry["match"] = identity.get("match")
+        if identity.get("profile_snapshot"):
+            entry["profile_snapshot"] = identity.get("profile_snapshot")
+        participant_entries.append(entry)
+
+    event_id = await db_manager.log_mission_participation(
+        mission_id,
+        mission_type,
+        participant_entries,
+        participants,
+        cost_per_participant=cost,
+        outcome=outcome,
+        source=source,
+        metadata=metadata_payload,
+    )
+
+    if event_id:
+        logger.info(
+            "Registrata partecipazione missione %s (event_id=%s) con %s partecipanti.",
+            mission_id or "manual",
+            event_id,
+            participant_count,
+        )
+
+    return event_id
+
+
+async def process_active_mission_auto():
+    """
+    Controlla se c'è una missione attiva tramite GET /clans/{CLAN_ID}/quests/active.
+    Se la missione è attiva e non ancora processata, sottrae il costo per ogni partecipante
+    in base al tipo (Gold=500, Gem=150 o 140) e registra la missione nella collection
+    "processed_active_missions" per evitare duplicazioni.
+    """
+    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/active"
+    headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.error(f"Errore nel recupero della missione attiva: {resp.status}")
+                return
+            active_data = await resp.json()
+
+    # "quest" e "participants" e "tierStartTime" possono stare a livelli diversi
+    quest = active_data.get("quest")
+    if not quest:
+        logger.info("Nessuna missione attiva trovata.")
+        return
+
+    mission_id = quest.get("id")
+    tier_start_time = active_data.get("tierStartTime")  # <-- estratto dal top-level
+    if not mission_id or not tier_start_time:
+        logger.error("Missione attiva priva di id o tierStartTime.")
+        return
+
+    if await db_manager.has_processed_active_mission(mission_id):
+        logger.info(f"Missione {mission_id} già processata. Nessuna operazione eseguita.")
+        return
+
+    # Partecipanti a livello top
+    participants = active_data.get("participants", [])
+    raw_usernames = [p.get("username") for p in participants if p.get("username")]
+    if not raw_usernames:
+        logger.info("Nessun partecipante trovato nella missione attiva.")
+        return
+
+    resolved_identities: List[Dict[str, Any]] = []
+    alias_resolved_count = 0
+    unresolved_usernames: List[str] = []
+    for username in raw_usernames:
+        identity = await identity_service.resolve_member_identity(username)
+        resolved_username = identity.get("resolved_username")
+        if not resolved_username:
+            logger.warning(
+                "Missione attiva %s: ignorato username non valido (%s)",
+                mission_id,
+                username,
+            )
+            unresolved_usernames.append(username)
+            continue
+        if (
+            identity.get("match") == "history"
+            and identity.get("original_username")
+            and identity.get("original_username") != resolved_username
+        ):
+            alias_resolved_count += 1
+            logger.info(
+                "Missione attiva %s: alias risolto %s → %s",
+                mission_id,
+                identity.get("original_username"),
+                resolved_username,
+            )
+        resolved_identities.append(identity)
+
+    if not resolved_identities:
+        logger.info("Missione %s: nessun partecipante valido dopo la risoluzione.", mission_id)
+        return
+
+    participant_count = len(resolved_identities)
+
+    mission_type = "Gem" if quest.get("purchasableWithGems", False) else "Gold"
+    if mission_type == "Gold":
+        cost = 500
+    else:
+        if participant_count > 7:
+            cost = 140
+        elif 5 <= participant_count <= 7:
+            cost = 150
+        else:
+            cost = 0
+
+    if cost:
+        for identity in resolved_identities:
+            await maintenance_service.update_user_balance(
+                identity["resolved_username"], mission_type, -cost
+            )
+            log_name = identity.get("resolved_username")
+            original = identity.get("original_username")
+            if original and original != log_name:
+                logger.info(
+                    "Dedotto %s %s per %s (alias %s) nella missione %s",
+                    cost,
+                    "Oro" if mission_type == "Gold" else "Gem",
+                    log_name,
+                    original,
+                    mission_id,
+                )
+            else:
+                logger.info(
+                    "Dedotto %s %s per %s nella missione %s",
+                    cost,
+                    "Oro" if mission_type == "Gold" else "Gem",
+                    log_name,
+                    mission_id,
+                )
+    else:
+        logger.info(
+            "Missione attiva %s registrata senza costi aggiuntivi.",
+            mission_id,
+        )
+
+    metadata = {
+        "tier_start_time": tier_start_time,
+        "participants_count": len(raw_usernames),
+        "resolved_participants_count": participant_count,
+        "alias_resolutions": alias_resolved_count,
+        "linked_participants": sum(
+            1 for identity in resolved_identities if identity.get("telegram_id")
+        ),
+        "cost_applied": cost,
+    }
+    if unresolved_usernames:
+        metadata["unresolved_participants"] = unresolved_usernames
+        metadata["unresolved_participants_count"] = len(unresolved_usernames)
+    else:
+        metadata["unresolved_participants_count"] = 0
+
+    participant_entries: List[Dict[str, Any]] = []
+    for identity in resolved_identities:
+        entry: Dict[str, Any] = {
+            "username": identity.get("resolved_username"),
+            "original_username": identity.get("original_username"),
+        }
+        if identity.get("telegram_id") is not None:
+            entry["telegram_id"] = identity.get("telegram_id")
+        if identity.get("telegram_username"):
+            entry["telegram_username"] = identity.get("telegram_username")
+        if identity.get("match"):
+            entry["match"] = identity.get("match")
+        if identity.get("profile_snapshot"):
+            entry["profile_snapshot"] = identity.get("profile_snapshot")
+        participant_entries.append(entry)
+
+    event_id = await db_manager.log_mission_participation(
+        mission_id,
+        mission_type,
+        participant_entries,
+        raw_usernames,
+        cost_per_participant=cost,
+        outcome="auto_processed",
+        source="active_mission",
+        metadata=metadata,
+    )
+
+    await db_manager.mark_active_mission_processed(mission_id, tier_start_time)
+    logger.info(
+        "Missione %s processata e registrata (event_id=%s).",
+        mission_id,
+        event_id or "N/A",
+    )
+
 
 # =============================================================================
 # FUNZIONI HELPER PER FSM E GESTIONE MESSAGGI DI MODIFICA
@@ -613,6 +930,62 @@ mission_service.register_handlers(dp)
 # =============================================================================
 # CONFIGURAZIONE DELLO SCHEDULER
 # =============================================================================
+def setup_scheduler(scheduler: AsyncIOScheduler) -> AsyncIOScheduler:
+    """Configura lo scheduler condiviso e avvia i job di manutenzione."""
+
+    # CORREZIONE: Invio skin/messaggi lunedì alle 8:00 (non 11:00)
+    scheduler.add_job(
+        scheduled_mission_skin,
+        "cron",
+        day_of_week="mon",
+        hour=8,  # Cambiato da 11 a 8
+        minute=0,
+        timezone="Europe/Rome"
+    )
+    scheduler.add_job(
+        maintenance_service.process_ledger,
+        "interval",
+        minutes=5,
+        next_run_time=datetime.now(),
+    )
+    scheduler.add_job(process_active_mission_auto, "interval", minutes=5, next_run_time=datetime.now())
+    scheduler.add_job(
+        maintenance_service.prepopulate_users,
+        "interval",
+        days=3,
+        next_run_time=datetime.now(),
+    )
+    scheduler.add_job(
+        identity_service.refresh_linked_profiles,
+        "interval",
+        minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
+        next_run_time=datetime.now(),
+    )
+
+    # NUOVE funzioni per pulizia e controllo
+    scheduler.add_job(
+        maintenance_service.clean_duplicate_users,
+        "interval",
+        hours=24,
+        next_run_time=datetime.now(),
+    )  # Ogni giorno
+    scheduler.add_job(
+        maintenance_service.check_clan_departures,
+        "interval",
+        hours=6,
+        next_run_time=datetime.now(),
+    )   # Ogni 6 ore
+    # NUOVO: Controllo reminder calendario
+    #scheduler.add_job(calendar_service.check_pending_reminders, "interval", minutes=1)
+
+    # NUOVO: Pulizia log settimanale
+    #scheduler.add_job(cleanup_old_logs, "cron", day_of_week="sun", hour=2, minute=0)
+
+    if not scheduler.running:
+        scheduler.start()
+    logger.info("Scheduler configurato con tutte le funzioni di manutenzione.")
+    return scheduler
+
 # =============================================================================
 # FUNZIONI VARIE DI SUPPORTO
 # =============================================================================
@@ -1982,6 +2355,11 @@ async def main():
     )
     await maintenance_service.prepopulate_users()
     await identity_service.refresh_linked_profiles()
+    setup_scheduler(scheduler)
+    await maintenance_service.prepopulate_users()
+    await identity_service.refresh_linked_profiles()
+    await prepopulate_users()
+    await refresh_linked_profiles()
 
     # NUOVO: Notifica avvio bot
     try:
