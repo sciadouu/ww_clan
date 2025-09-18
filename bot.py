@@ -2732,6 +2732,8 @@ async def main():
     setup_scheduler(scheduler)
     await maintenance_service.prepopulate_users()
     await identity_service.refresh_linked_profiles()
+    await prepopulate_users()
+    await refresh_linked_profiles()
 
     # NUOVO: Notifica avvio bot
     try:
