@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import uuid4
@@ -51,6 +51,67 @@ class MongoManager:
         """Espone la normalizzazione delle valute."""
 
         return self._normalize_currency(currency)
+
+    @staticmethod
+    def _ensure_utc(date_value: datetime) -> datetime:
+        """Rende timezone-aware un datetime convertendolo in UTC."""
+
+        if date_value.tzinfo is None:
+            return date_value.replace(tzinfo=timezone.utc)
+        return date_value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _interval_to_format(interval: str) -> str:
+        """Restituisce il formato stringa da utilizzare per il grouping temporale."""
+
+        mapping = {
+            "day": "%Y-%m-%d",
+            "week": "%G-W%V",
+            "month": "%Y-%m",
+        }
+        return mapping.get(interval.lower(), "%Y-%m-%d")
+
+    @staticmethod
+    def _normalize_currency_key(currency: Optional[str]) -> Optional[str]:
+        """Normalizza la valuta in chiave utilizzabile per gli aggregati."""
+
+        if not currency:
+            return None
+
+        normalized = currency.strip().lower()
+        if normalized in {"gold", "oro"}:
+            return "gold"
+        if normalized in {"gem", "gems", "gemme"}:
+            return "gems"
+        return None
+
+    @classmethod
+    def _build_time_filter(
+        cls,
+        *,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        days: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Costruisce un filtro MongoDB per il range temporale richiesto."""
+
+        computed_start = start
+        computed_end = end
+
+        if days is not None:
+            safe_days = max(int(days), 0)
+            computed_end = computed_end or datetime.now(timezone.utc)
+            computed_start = computed_start or (
+                computed_end - timedelta(days=safe_days)
+            )
+
+        constraints: Dict[str, Any] = {}
+        if computed_start is not None:
+            constraints["$gte"] = cls._ensure_utc(computed_start)
+        if computed_end is not None:
+            constraints["$lte"] = cls._ensure_utc(computed_end)
+
+        return constraints
 
     async def ensure_user(self, username: str) -> bool:
         """Crea l'utente se non esiste, restituendo True se inserito."""
@@ -377,6 +438,320 @@ class MongoManager:
 
         result = await self.missions_history_col.insert_one(document)
         return str(result.inserted_id)
+
+    async def get_donation_time_series(
+        self,
+        *,
+        days: Optional[int] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        username: Optional[str] = None,
+        interval: str = "day",
+    ) -> List[Dict[str, Any]]:
+        """Aggrega le donazioni in serie temporali per uso statistico."""
+
+        match: Dict[str, Any] = {}
+        time_filter = self._build_time_filter(start=start, end=end, days=days)
+        if time_filter:
+            match["processed_at"] = time_filter
+        if username:
+            match["username"] = username
+
+        pipeline: List[Dict[str, Any]] = []
+        if match:
+            pipeline.append({"$match": match})
+
+        date_format = self._interval_to_format(interval)
+        pipeline.extend(
+            [
+                {
+                    "$group": {
+                        "_id": {
+                            "$dateToString": {
+                                "format": date_format,
+                                "date": "$processed_at",
+                                "timezone": "UTC",
+                            }
+                        },
+                        "gold": {"$sum": {"$ifNull": ["$gold", 0]}},
+                        "gems": {"$sum": {"$ifNull": ["$gems", 0]}},
+                        "donations": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "date": "$_id",
+                        "gold": "$gold",
+                        "gems": "$gems",
+                        "donations": "$donations",
+                    }
+                },
+            ]
+        )
+
+        return await self.donation_history_col.aggregate(pipeline).to_list(length=None)
+
+    async def get_top_donors(
+        self,
+        *,
+        limit: int = 10,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        days: Optional[int] = None,
+        currency: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Restituisce i donatori principali in un intervallo temporale."""
+
+        match: Dict[str, Any] = {}
+        time_filter = self._build_time_filter(start=start, end=end, days=days)
+        if time_filter:
+            match["processed_at"] = time_filter
+
+        pipeline: List[Dict[str, Any]] = []
+        if match:
+            pipeline.append({"$match": match})
+
+        pipeline.append(
+            {
+                "$group": {
+                    "_id": "$username",
+                    "total_gold": {"$sum": {"$ifNull": ["$gold", 0]}},
+                    "total_gems": {"$sum": {"$ifNull": ["$gems", 0]}},
+                    "donation_count": {"$sum": 1},
+                    "last_donation": {"$max": "$processed_at"},
+                }
+            }
+        )
+
+        normalized_currency = self._normalize_currency_key(currency)
+        if normalized_currency == "gold":
+            pipeline.append({"$addFields": {"total_amount": "$total_gold"}})
+        elif normalized_currency == "gems":
+            pipeline.append({"$addFields": {"total_amount": "$total_gems"}})
+        else:
+            pipeline.append(
+                {"$addFields": {"total_amount": {"$add": ["$total_gold", "$total_gems"]}}}
+            )
+
+        pipeline.extend(
+            [
+                {"$sort": {"total_amount": -1, "_id": 1}},
+                {"$limit": max(int(limit), 1)},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "username": "$_id",
+                        "total_gold": "$total_gold",
+                        "total_gems": "$total_gems",
+                        "donation_count": "$donation_count",
+                        "last_donation": "$last_donation",
+                        "total_amount": "$total_amount",
+                    }
+                },
+            ]
+        )
+
+        return await self.donation_history_col.aggregate(pipeline).to_list(length=None)
+
+    async def get_mission_time_series(
+        self,
+        *,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        days: Optional[int] = None,
+        mission_type: Optional[str] = None,
+        interval: str = "day",
+    ) -> List[Dict[str, Any]]:
+        """Aggrega le missioni svolte in base al periodo scelto."""
+
+        match: Dict[str, Any] = {}
+        time_filter = self._build_time_filter(start=start, end=end, days=days)
+        if time_filter:
+            match["processed_at"] = time_filter
+        if mission_type:
+            match["mission_type"] = {
+                "$regex": rf"^{re.escape(mission_type.strip())}$",
+                "$options": "i",
+            }
+
+        pipeline: List[Dict[str, Any]] = []
+        if match:
+            pipeline.append({"$match": match})
+
+        date_format = self._interval_to_format(interval)
+        pipeline.extend(
+            [
+                {
+                    "$group": {
+                        "_id": {
+                            "$dateToString": {
+                                "format": date_format,
+                                "date": "$processed_at",
+                                "timezone": "UTC",
+                            }
+                        },
+                        "missions": {"$sum": 1},
+                        "participants": {
+                            "$sum": {
+                                "$ifNull": [
+                                    "$participant_count",
+                                    {
+                                        "$size": {
+                                            "$ifNull": ["$participants", []]
+                                        }
+                                    },
+                                ]
+                            }
+                        },
+                        "total_cost": {"$sum": {"$ifNull": ["$total_cost", 0]}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "date": "$_id",
+                        "missions": "$missions",
+                        "participants": "$participants",
+                        "total_cost": "$total_cost",
+                    }
+                },
+            ]
+        )
+
+        return await self.missions_history_col.aggregate(pipeline).to_list(length=None)
+
+    async def get_mission_participation(
+        self,
+        *,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        days: Optional[int] = None,
+        mission_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Restituisce le missioni registrate con metadati utili."""
+
+        query: Dict[str, Any] = {}
+        time_filter = self._build_time_filter(start=start, end=end, days=days)
+        if time_filter:
+            query["processed_at"] = time_filter
+        if mission_type:
+            query["mission_type"] = {
+                "$regex": rf"^{re.escape(mission_type.strip())}$",
+                "$options": "i",
+            }
+
+        cursor = self.missions_history_col.find(query).sort("processed_at", 1)
+        if limit is not None:
+            cursor = cursor.limit(int(limit))
+
+        documents = await cursor.to_list(length=None)
+
+        results: List[Dict[str, Any]] = []
+        for document in documents:
+            participant_count = document.get("participant_count")
+            if participant_count is None:
+                participant_count = len(document.get("participants", []) or [])
+
+            results.append(
+                {
+                    "mission_id": document.get("mission_id"),
+                    "mission_type": document.get("mission_type"),
+                    "participants": participant_count,
+                    "processed_at": document.get("processed_at"),
+                    "total_cost": document.get("total_cost", 0),
+                    "outcome": document.get("outcome"),
+                    "source": document.get("source"),
+                }
+            )
+
+        return results
+
+    async def get_top_participants(
+        self,
+        *,
+        limit: int = 10,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        days: Optional[int] = None,
+        mission_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Calcola i giocatori più attivi nelle missioni."""
+
+        match: Dict[str, Any] = {}
+        time_filter = self._build_time_filter(start=start, end=end, days=days)
+        if time_filter:
+            match["processed_at"] = time_filter
+        if mission_type:
+            match["mission_type"] = {
+                "$regex": rf"^{re.escape(mission_type.strip())}$",
+                "$options": "i",
+            }
+
+        pipeline: List[Dict[str, Any]] = []
+        if match:
+            pipeline.append({"$match": match})
+
+        pipeline.extend(
+            [
+                {"$unwind": "$participants"},
+                {
+                    "$group": {
+                        "_id": "$participants.username",
+                        "missions": {"$sum": 1},
+                        "total_cost": {
+                            "$sum": {"$ifNull": ["$participants.cost", 0]}
+                        },
+                        "last_participation": {"$max": "$processed_at"},
+                    }
+                },
+                {"$sort": {"missions": -1, "total_cost": -1, "_id": 1}},
+                {"$limit": max(int(limit), 1)},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "username": "$_id",
+                        "missions": "$missions",
+                        "total_cost": "$total_cost",
+                        "last_participation": "$last_participation",
+                    }
+                },
+            ]
+        )
+
+        return await self.missions_history_col.aggregate(pipeline).to_list(length=None)
+
+    async def calculate_success_rate(
+        self,
+        *,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        days: Optional[int] = None,
+        mission_type: Optional[str] = None,
+    ) -> float:
+        """Calcola la percentuale di missioni con esito positivo."""
+
+        query: Dict[str, Any] = {}
+        time_filter = self._build_time_filter(start=start, end=end, days=days)
+        if time_filter:
+            query["processed_at"] = time_filter
+        if mission_type:
+            query["mission_type"] = {
+                "$regex": rf"^{re.escape(mission_type.strip())}$",
+                "$options": "i",
+            }
+
+        total_missions = await self.missions_history_col.count_documents(query)
+        if total_missions == 0:
+            return 0.0
+
+        success_query = dict(query)
+        success_query["outcome"] = {"$nin": ["failed", "cancelled", "error"]}
+        successful = await self.missions_history_col.count_documents(success_query)
+        return successful / total_missions
 
     async def fetch_user(self, username: str) -> Optional[Dict[str, Any]]:
         """Recupera i dati di un utente dal database."""
