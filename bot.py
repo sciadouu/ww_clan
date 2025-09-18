@@ -17,23 +17,24 @@ from urllib.parse import quote_plus
 import requests
 import aiohttp
 from PIL import Image
-import motor.motor_asyncio
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 # Import di Aiogram
-from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram import types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, FSInputFile, Message, ChatMemberUpdated
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import Command, ChatMemberUpdatedFilter, KICKED, MEMBER, ADMINISTRATOR
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound
+from services.identity_service import (
+    IdentityService,
+    format_markdown_code,
+    format_telegram_username,
+)
+from services.maintenance_service import MaintenanceService
+from services.mission_service import MissionService
 from services.notification_service import EnhancedNotificationService, NotificationType
-from services.db_manager import MongoManager
+from bot_app import create_app_context
+from bot_app.scheduler import setup_scheduler
 from config import (
     TOKEN,
     WOLVESVILLE_API_KEY,
@@ -98,29 +99,6 @@ def maybe_log_public_ip() -> None:
         logger.info("IP pubblico del bot: %s", public_ip)
 
 
-def format_telegram_username(username: Optional[str]) -> str:
-    """Restituisce uno username Telegram formattato con @ oppure un segnaposto."""
-
-    if not username:
-        return "—"
-    cleaned = username.strip()
-    if not cleaned:
-        return "—"
-    return cleaned if cleaned.startswith("@") else f"@{cleaned}"
-
-
-def format_markdown_code(value: Optional[Any]) -> str:
-    """Formatta un valore come blocco inline oppure restituisce un segnaposto."""
-
-    if value is None:
-        return "—"
-    text = str(value).strip()
-    if not text or text == "—":
-        return "—"
-    safe = text.replace("`", "\\`")
-    return f"`{safe}`"
-
-
 def schedule_admin_notification(
     message: str,
     *,
@@ -148,197 +126,6 @@ def schedule_admin_notification(
         logger.warning(
             "Loop asyncio non attivo: impossibile pianificare la notifica admin immediatamente."
         )
-
-
-def build_profile_snapshot(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Estrae un sottoinsieme sicuro dei dati del profilo per i log."""
-
-    if not profile:
-        return None
-
-    snapshot: Dict[str, Any] = {
-        "telegram_id": profile.get("telegram_id"),
-        "telegram_username": profile.get("telegram_username"),
-        "game_username": profile.get("game_username"),
-        "wolvesville_id": profile.get("wolvesville_id"),
-    }
-
-    if profile.get("updated_at"):
-        snapshot["updated_at"] = profile.get("updated_at")
-    if profile.get("created_at"):
-        snapshot["created_at"] = profile.get("created_at")
-
-    verification = profile.get("verification")
-    if isinstance(verification, dict):
-        snapshot["verification"] = {
-            key: verification.get(key)
-            for key in ("status", "verified_at", "method", "code")
-            if verification.get(key) is not None
-        }
-
-    return snapshot
-
-
-def handle_telegram_sync_result(
-    result: Optional[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    """Invia notifiche se cambia lo username Telegram e restituisce il profilo aggiornato."""
-
-    if not result:
-        return None
-
-    profile = result.get("profile")
-    if profile is None:
-        return None
-
-    if result.get("telegram_username_changed"):
-        game_username = profile.get("game_username")
-        if game_username:
-            old_username = format_telegram_username(
-                result.get("previous_telegram_username")
-            )
-            new_username = format_telegram_username(profile.get("telegram_username"))
-            message = (
-                "♻️ **Aggiornamento username Telegram**\n\n"
-                f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
-                f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-                f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
-            )
-            schedule_admin_notification(
-                message,
-                notification_type=NotificationType.INFO,
-            )
-
-    return profile
-
-
-def handle_profile_link_result(
-    result: Optional[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    """Analizza il risultato del linking e notifica variazioni allo username di gioco."""
-
-    if not result or result.get("conflict"):
-        return result.get("profile") if result else None
-
-    profile = result.get("profile")
-    if profile is None:
-        return None
-
-    if result.get("game_username_changed") and result.get("previous_game_username"):
-        telegram_display = format_telegram_username(profile.get("telegram_username"))
-        message = (
-            "♻️ **Aggiornamento username Wolvesville**\n\n"
-            f"💬 **Telegram:** {format_markdown_code(telegram_display)}\n"
-            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-            f"🆔 **Wolvesville ID:** {format_markdown_code(profile.get('wolvesville_id'))}\n"
-            f"🔁 **Username:** {format_markdown_code(result.get('previous_game_username'))} → {format_markdown_code(profile.get('game_username'))}"
-        )
-        schedule_admin_notification(
-            message,
-            notification_type=NotificationType.INFO,
-        )
-
-    return profile
-
-
-async def resolve_member_identity(username: Optional[str]) -> Dict[str, Any]:
-    """Risolvi uno username di gioco in base al profilo collegato."""
-
-    raw_username = username or ""
-    cleaned_username = raw_username.strip()
-
-    identity: Dict[str, Any] = {
-        "input_username": username,
-        "original_username": cleaned_username or None,
-        "resolved_username": cleaned_username or None,
-        "telegram_id": None,
-        "telegram_username": None,
-        "match": None,
-        "profile": None,
-        "profile_snapshot": None,
-    }
-
-    if not cleaned_username:
-        return identity
-
-    try:
-        resolution = await db_manager.resolve_profile_by_game_alias(cleaned_username)
-    except Exception as exc:  # pragma: no cover - log diagnostico
-        logger.warning(
-            "Impossibile risolvere il profilo per %s: %s",
-            cleaned_username,
-            exc,
-        )
-        return identity
-
-    if not resolution:
-        return identity
-
-    profile = resolution.get("profile") or {}
-    resolved_username = resolution.get("resolved_username") or cleaned_username
-
-    identity.update(
-        {
-            "resolved_username": resolved_username,
-            "match": resolution.get("match"),
-            "telegram_id": profile.get("telegram_id"),
-            "telegram_username": profile.get("telegram_username"),
-            "profile": profile,
-            "profile_snapshot": build_profile_snapshot(profile),
-        }
-    )
-
-    return identity
-
-
-async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
-    """Allinea il profilo Telegram con il database e notifica eventuali cambi username."""
-
-    if user is None:
-        return
-
-    full_name_parts = [user.first_name or "", user.last_name or ""]
-    full_name = " ".join(part for part in full_name_parts if part).strip() or None
-
-    try:
-        result = await db_manager.sync_telegram_metadata(
-            user.id,
-            telegram_username=user.username,
-            full_name=full_name,
-        )
-    except Exception as exc:  # pragma: no cover - logging di sicurezza
-        logger.warning(
-            "Impossibile aggiornare il profilo Telegram per %s: %s",
-            getattr(user, "id", "?"),
-            exc,
-        )
-        return
-
-    if not result or result.get("created"):
-        return
-
-    handle_telegram_sync_result(result)
-    if (
-        result.get("telegram_username_changed")
-        and result.get("profile")
-    ):
-        profile = result["profile"]
-        game_username = profile.get("game_username")
-        if not game_username:
-            return
-        old_username = format_telegram_username(result.get("previous_telegram_username"))
-        new_username = format_telegram_username(profile.get("telegram_username"))
-        message = (
-            "♻️ **Aggiornamento username Telegram**\n\n"
-            f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
-            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-            f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
-        )
-        schedule_admin_notification(
-            message,
-            notification_type=NotificationType.INFO,
-        )
-
 # =============================================================================
 # CONFIGURAZIONE DI MONGODB
 # =============================================================================
@@ -346,8 +133,39 @@ MONGO_URI = "mongodb+srv://Admin:X3TaVDKSSQDcfUG@wolvesville.6mrnmcn.mongodb.net
 DATABASE_NAME = "Wolvesville"
 USERS_COLLECTION = "users"
 
-mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, tlsAllowInvalidCertificates=True)
-db_manager = MongoManager(mongo_client, DATABASE_NAME)
+app_context = create_app_context(
+    token=TOKEN,
+    mongo_uri=MONGO_URI,
+    database_name=DATABASE_NAME,
+    admin_ids=ADMIN_IDS,
+    admin_channel_id=ADMIN_NOTIFICATION_CHANNEL,
+    owner_id=OWNER_CHAT_ID,
+)
+
+bot = app_context.bot
+dp = app_context.dispatcher
+notification_service = app_context.notification_service
+db_manager = app_context.db_manager
+scheduler = app_context.scheduler
+mongo_client = app_context.mongo_client
+
+identity_service = IdentityService(
+    bot=bot,
+    db_manager=db_manager,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    schedule_admin_notification=schedule_admin_notification,
+    logger=logger,
+)
+
+maintenance_service = MaintenanceService(
+    bot=bot,
+    db_manager=db_manager,
+    identity_service=identity_service,
+    clan_id=CLAN_ID,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    admin_ids=ADMIN_IDS,
+    logger=logger,
+)
 
 # Tempo di reset per considerare solo le donazioni future
 RESET_TIME = datetime.now(timezone.utc)
@@ -364,7 +182,7 @@ class LoggingMiddleware(BaseMiddleware):
             text = event.text if event.text else "<Non testuale>"
             logger.info(f"Messaggio ricevuto | Chat ID: {chat_id} | Thread ID: {thread_id} | Utente ID: {user_id} | Testo: {text}")
             try:
-                await ensure_telegram_profile_synced(event.from_user)
+                await identity_service.ensure_telegram_profile_synced(event.from_user)
             except Exception as exc:  # pragma: no cover - evitare crash middleware
                 logger.warning("Sync profilo Telegram fallita per %s: %s", user_id, exc)
         return await handler(event, data)
@@ -377,659 +195,6 @@ class UpdateLoggingMiddleware(BaseMiddleware):
 # =============================================================================
 # FUNZIONI DI ACCESSO AL DATABASE
 # =============================================================================
-# Aggiungi questa funzione dopo le altre funzioni di database
-
-# Aggiungi questa funzione dopo le altre funzioni di database
-async def clean_duplicate_users():
-    """
-    Rimuove utenti duplicati dal database mantenendo solo uno per username.
-    """
-    try:
-        removed_info = await db_manager.remove_duplicate_users()
-        total_removed = sum(item.get("removed", 0) for item in removed_info)
-
-        for item in removed_info:
-            username = item.get("username", "sconosciuto")
-            removed = item.get("removed", 0)
-            removed_ids = item.get("removed_ids", [])
-            logger.info(
-                "Eliminati %s duplicati per %s (documenti rimossi: %s)",
-                removed,
-                username,
-                removed_ids,
-            )
-
-        logger.info(
-            "Pulizia duplicati completata. Eliminati %s duplicati.",
-            total_removed,
-        )
-
-    except Exception as e:
-        logger.error(f"Errore durante pulizia duplicati: {e}")
-
-async def check_clan_departures():
-    """
-    Controlla se qualche utente è uscito dal clan e gestisce debiti/pulizia.
-    VERSIONE MIGLIORATA con più controlli di sicurezza.
-    """
-    try:
-        # Ottieni membri attuali del clan
-        url = f"https://api.wolvesville.com/clans/{CLAN_ID}/members"
-        headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status != 200:
-                    logger.error(f"Errore nel recupero membri clan: {response.status}")
-                    return
-                current_members = await response.json()
-
-        # Estrai usernames attuali (con validazione)
-        current_usernames = set()
-        for member in current_members:
-            username = member.get("username")
-            if username and isinstance(username, str) and len(username) > 0:
-                current_usernames.add(username)
-
-        # Ottieni tutti gli utenti nel database
-        db_users = await db_manager.list_users()
-
-        users_removed = 0
-        debt_notifications = 0
-
-        # Controlla chi è uscito dal clan
-        for user in db_users:
-            username = user.get("username")
-            if not username or username in current_usernames:
-                continue  # Utente ancora nel clan o username non valido
-
-            donazioni = user.get("donazioni", {})
-            oro = donazioni.get("Oro", 0)
-            gem = donazioni.get("Gem", 0)
-
-            # Assicurati che oro e gem siano numeri
-            try:
-                oro = int(oro) if oro is not None else 0
-                gem = int(gem) if gem is not None else 0
-            except (ValueError, TypeError):
-                oro = gem = 0
-
-            # Se ha debiti (valori negativi)
-            if oro < 0 or gem < 0:
-                # Invia notifica admin
-                debt_message = (
-                    f"🚨 <b>USCITA CON DEBITI</b> 🚨\n\n"
-                    f"👤 <b>Utente:</b> {username}\n"
-                    f"💰 <b>Debito Oro:</b> {abs(oro) if oro < 0 else 0:,}\n"
-                    f"💎 <b>Debito Gem:</b> {abs(gem) if gem < 0 else 0:,}\n\n"
-                    f"⚠️ L'utente ha abbandonato il clan con debiti non saldati!\n"
-                    f"📅 Data controllo: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-                )
-
-                # Invia a tutti gli admin
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin_id, debt_message, parse_mode="HTML")
-                        debt_notifications += 1
-                    except Exception as e:
-                        logger.warning(f"Impossibile inviare notifica debito ad admin {admin_id}: {e}")
-
-                logger.info(f"Notificato debito per utente uscito: {username} (Oro: {oro}, Gem: {gem})")
-
-            else:
-                # Nessun debito, elimina dal database
-                removed = await db_manager.remove_user_by_username(username)
-                if removed > 0:
-                    users_removed += 1
-                    logger.info(f"Utente {username} rimosso dal database (nessun debito)")
-
-        # Log riassuntivo
-        logger.info(f"Controllo uscite clan completato: {users_removed} utenti rimossi, {debt_notifications} notifiche debiti inviate")
-
-    except Exception as e:
-        logger.error(f"Errore durante controllo uscite clan: {e}")
-
-
-# MODIFICA la funzione prepopulate_users per evitare duplicati futuri
-async def prepopulate_users():
-    """
-    Pre-popolazione degli utenti: per ogni membro recuperato dall'API del clan,
-    crea un record (se non esistente) con bilancio iniziale a 0.
-    EVITA DUPLICATI usando username come chiave unica.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/members"
-    headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                logger.error(f"Errore nel recupero dei membri: {response.status}")
-                return
-            members = await response.json()
-
-            for member in members:
-                username = member.get("username")
-                if username:
-                    # UPSERT con controllo duplicati migliorato
-                    inserted = await db_manager.ensure_user(username)
-                    if inserted:
-                        logger.info(f"Utente {username} pre-popolato con bilancio 0.")
-
-
-async def refresh_linked_profiles() -> None:
-    """Sincronizza periodicamente gli username Telegram e Wolvesville già collegati."""
-
-    try:
-        profiles = await db_manager.list_linked_player_profiles()
-    except Exception as exc:
-        logger.warning("Impossibile recuperare i profili collegati: %s", exc)
-        return
-
-    if not profiles:
-        return
-
-    async with aiohttp.ClientSession() as wolvesville_session:
-        for profile in profiles:
-            telegram_id = profile.get("telegram_id")
-            if not telegram_id:
-                continue
-
-            latest_profile = profile
-
-            try:
-                chat = await bot.get_chat(telegram_id)
-            except TelegramForbiddenError:
-                logger.debug(
-                    "Sync Telegram ignorato per %s: bot bloccato", telegram_id
-                )
-            except TelegramNotFound:
-                logger.debug(
-                    "Sync Telegram ignorato per %s: utente non trovato", telegram_id
-                )
-            except TelegramBadRequest as exc:
-                logger.debug(
-                    "Sync Telegram fallito per %s: %s", telegram_id, exc
-                )
-            else:
-                chat_full_name = (
-                    " ".join(
-                        part
-                        for part in [chat.first_name, chat.last_name]
-                        if part
-                    ).strip()
-                    or None
-                )
-                try:
-                    result = await db_manager.sync_telegram_metadata(
-                        telegram_id,
-                        telegram_username=chat.username,
-                        full_name=chat_full_name,
-                    )
-                except Exception as exc:  # pragma: no cover - diagnosi schedulatore
-                    logger.warning(
-                        "Sync Telegram fallito per %s: %s", telegram_id, exc
-                    )
-                else:
-                    updated_profile = handle_telegram_sync_result(result)
-                    if updated_profile:
-                        latest_profile = updated_profile
-
-            wolvesville_id = (
-                latest_profile.get("wolvesville_id")
-                if isinstance(latest_profile, dict)
-                else profile.get("wolvesville_id")
-            )
-            if not wolvesville_id:
-                continue
-
-            player_info = await fetch_player_by_id(
-                wolvesville_id,
-                session=wolvesville_session,
-            )
-            if not player_info:
-                continue
-
-            new_username = player_info.get("username")
-            if not new_username:
-                continue
-
-            try:
-                link_result = await db_manager.link_player_profile(
-                    telegram_id,
-                    game_username=new_username,
-                    telegram_username=latest_profile.get("telegram_username")
-                    if isinstance(latest_profile, dict)
-                    else profile.get("telegram_username"),
-                    full_name=latest_profile.get("full_name")
-                    if isinstance(latest_profile, dict)
-                    else profile.get("full_name"),
-                    wolvesville_id=wolvesville_id,
-                    verified=False,
-                    verification_code=None,
-                    verification_method=None,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Aggiornamento profilo Wolvesville fallito per %s: %s",
-                    telegram_id,
-                    exc,
-                )
-                continue
-
-            if link_result and link_result.get("conflict"):
-                logger.warning(
-                    "Conflitto durante l'aggiornamento del profilo per %s: %s",
-                    telegram_id,
-                    link_result.get("reason"),
-                )
-                continue
-
-            updated_profile = handle_profile_link_result(link_result)
-            if updated_profile:
-                latest_profile = updated_profile
-
-            await asyncio.sleep(0.1)
-
-
-async def update_user_balance(username: str, currency: str, amount: int):
-    """
-    Aggiorna il bilancio di un utente per una determinata valuta.
-    Se 'currency' è "gold" (o qualunque forma simile) viene usato il campo "Oro",
-    mentre se è "gem" viene usato "Gem". In questo modo si evita di creare campi
-    duplicati (es. "Gold") e si mantiene il DB con soli due campi: Oro e Gem.
-    """
-    normalized_currency = await db_manager.update_user_balance(username, currency, amount)
-    logger.info(f"Aggiornato bilancio per {username}: {normalized_currency} += {amount}")
-
-
-async def process_ledger():
-    """
-    Recupera il ledger dal clan e aggiorna il DB solo con i record di tipo "DONATE" non ancora processati.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/ledger"
-    headers = {
-        "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-        "Accept": "application/json"
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                logger.error(f"Errore nel recupero del ledger: {response.status}")
-                return
-            ledger_data = await response.json()
-
-            for record in ledger_data:
-                record_id = record.get("id")
-                record_type = record.get("type", "")
-                # Vogliamo processare solo i record di tipo "DONATE"
-                if record_type != "DONATE":
-                    continue
-
-                # Verifica se abbiamo già processato questo record
-                if await db_manager.has_processed_ledger(record_id):
-                    # Significa che l'abbiamo già gestito, quindi skip
-                    continue
-
-                # Non ancora processato => aggiorna il bilancio
-                username = record.get("playerUsername")
-                gold_amount = record.get("gold", 0) or 0
-                gems_amount = record.get("gems", 0) or 0
-
-                # Se c'è un username e c'è effettivamente una donazione > 0
-                if username and (gold_amount > 0 or gems_amount > 0):
-                    identity = await resolve_member_identity(username)
-                    resolved_username = identity.get("resolved_username")
-                    if not resolved_username:
-                        logger.warning(
-                            "Record ledger %s ignorato: username non valido (%s)",
-                            record_id,
-                            username,
-                        )
-                        continue
-
-                    original_username = identity.get("original_username") or username
-                    if (
-                        identity.get("match") == "history"
-                        and original_username
-                        and original_username != resolved_username
-                    ):
-                        logger.info(
-                            "Ledger: risolto alias %s → %s (record %s)",
-                            original_username,
-                            resolved_username,
-                            record_id,
-                        )
-
-                    # Aggiungi gold a Oro
-                    if gold_amount > 0:
-                        await update_user_balance(resolved_username, "Oro", gold_amount)
-                    # Aggiungi gems
-                    if gems_amount > 0:
-                        await update_user_balance(resolved_username, "Gem", gems_amount)
-
-                    await db_manager.log_donation(
-                        record_id,
-                        resolved_username,
-                        gold_amount,
-                        gems_amount,
-                        raw_record=record,
-                        telegram_id=identity.get("telegram_id"),
-                        telegram_username=identity.get("telegram_username"),
-                        profile_snapshot=identity.get("profile_snapshot"),
-                        original_username=original_username,
-                        match_source=identity.get("match"),
-                    )
-
-                # Segna questo record come "già processato"
-                await db_manager.mark_ledger_processed(record_id, raw_record=record)
-
-async def process_mission(
-    participants: List[str],
-    mission_type: str,
-    *,
-    mission_id: Optional[str] = None,
-    outcome: str = "processed",
-    source: str = "manual",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    """Processa una missione, applica i costi e registra la partecipazione nel database."""
-
-    if not participants:
-        logger.info("Processo missione %s saltato: nessun partecipante fornito.", mission_type)
-        return None
-
-    mission_type = mission_type or "Unknown"
-    mission_type_lower = mission_type.lower()
-
-    resolved_identities: List[Dict[str, Any]] = []
-    alias_resolved_count = 0
-    unresolved_participants: List[str] = []
-
-    for participant in participants:
-        identity = await resolve_member_identity(participant)
-        resolved_username = identity.get("resolved_username")
-        if not resolved_username:
-            logger.warning(
-                "Missione %s: ignorato partecipante senza username valido (%s)",
-                mission_type,
-                participant,
-            )
-            unresolved_participants.append(participant)
-            continue
-        if (
-            identity.get("match") == "history"
-            and identity.get("original_username")
-            and identity.get("original_username") != resolved_username
-        ):
-            alias_resolved_count += 1
-            logger.info(
-                "Missione %s: alias risolto %s → %s",
-                mission_type,
-                identity.get("original_username"),
-                resolved_username,
-            )
-        resolved_identities.append(identity)
-
-    if not resolved_identities:
-        logger.info(
-            "Processo missione %s saltato: nessun partecipante risolto.",
-            mission_type,
-        )
-        return None
-
-    original_participant_count = len(participants)
-    participant_count = len(resolved_identities)
-    unresolved_count = max(original_participant_count - participant_count, 0)
-
-    cost = 0
-    currency_key = mission_type
-
-    if mission_type_lower == "gold":
-        cost = 500
-        currency_key = "Gold"
-    elif mission_type_lower == "gem":
-        if participant_count > 7:
-            cost = 140
-        elif 5 <= participant_count <= 7:
-            cost = 150
-        else:
-            cost = 0
-        currency_key = "Gem"
-
-    if cost != 0:
-        for identity in resolved_identities:
-            await update_user_balance(identity["resolved_username"], currency_key, -cost)
-        logger.info(
-            "Applicato costo di %s %s a %s partecipanti (missione %s).",
-            cost,
-            "Oro" if mission_type_lower == "gold" else "Gem",
-            participant_count,
-            mission_type,
-        )
-        if alias_resolved_count:
-            logger.info(
-                "Missione %s: %s partecipanti provenivano da alias storici.",
-                mission_type,
-                alias_resolved_count,
-            )
-    else:
-        logger.info(
-            "Registrata missione %s senza costi aggiuntivi per %s partecipanti.",
-            mission_type,
-            participant_count,
-        )
-
-    metadata_payload = dict(metadata or {})
-    metadata_payload.setdefault("participants_count", original_participant_count)
-    metadata_payload.setdefault("cost_applied", cost)
-    metadata_payload["resolved_participants_count"] = participant_count
-    metadata_payload["unresolved_participants_count"] = unresolved_count
-    metadata_payload["alias_resolutions"] = alias_resolved_count
-    metadata_payload["linked_participants"] = sum(
-        1 for identity in resolved_identities if identity.get("telegram_id")
-    )
-    if unresolved_participants:
-        metadata_payload["unresolved_participants"] = unresolved_participants
-
-    participant_entries: List[Dict[str, Any]] = []
-    for identity in resolved_identities:
-        entry: Dict[str, Any] = {
-            "username": identity.get("resolved_username"),
-            "original_username": identity.get("original_username"),
-        }
-        if identity.get("telegram_id") is not None:
-            entry["telegram_id"] = identity.get("telegram_id")
-        if identity.get("telegram_username"):
-            entry["telegram_username"] = identity.get("telegram_username")
-        if identity.get("match"):
-            entry["match"] = identity.get("match")
-        if identity.get("profile_snapshot"):
-            entry["profile_snapshot"] = identity.get("profile_snapshot")
-        participant_entries.append(entry)
-
-    event_id = await db_manager.log_mission_participation(
-        mission_id,
-        mission_type,
-        participant_entries,
-        participants,
-        cost_per_participant=cost,
-        outcome=outcome,
-        source=source,
-        metadata=metadata_payload,
-    )
-
-    if event_id:
-        logger.info(
-            "Registrata partecipazione missione %s (event_id=%s) con %s partecipanti.",
-            mission_id or "manual",
-            event_id,
-            participant_count,
-        )
-
-    return event_id
-
-
-async def process_active_mission_auto():
-    """
-    Controlla se c'è una missione attiva tramite GET /clans/{CLAN_ID}/quests/active.
-    Se la missione è attiva e non ancora processata, sottrae il costo per ogni partecipante
-    in base al tipo (Gold=500, Gem=150 o 140) e registra la missione nella collection
-    "processed_active_missions" per evitare duplicazioni.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/active"
-    headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                logger.error(f"Errore nel recupero della missione attiva: {resp.status}")
-                return
-            active_data = await resp.json()
-
-    # "quest" e "participants" e "tierStartTime" possono stare a livelli diversi
-    quest = active_data.get("quest")
-    if not quest:
-        logger.info("Nessuna missione attiva trovata.")
-        return
-
-    mission_id = quest.get("id")
-    tier_start_time = active_data.get("tierStartTime")  # <-- estratto dal top-level
-    if not mission_id or not tier_start_time:
-        logger.error("Missione attiva priva di id o tierStartTime.")
-        return
-
-    if await db_manager.has_processed_active_mission(mission_id):
-        logger.info(f"Missione {mission_id} già processata. Nessuna operazione eseguita.")
-        return
-
-    # Partecipanti a livello top
-    participants = active_data.get("participants", [])
-    raw_usernames = [p.get("username") for p in participants if p.get("username")]
-    if not raw_usernames:
-        logger.info("Nessun partecipante trovato nella missione attiva.")
-        return
-
-    resolved_identities: List[Dict[str, Any]] = []
-    alias_resolved_count = 0
-    unresolved_usernames: List[str] = []
-    for username in raw_usernames:
-        identity = await resolve_member_identity(username)
-        resolved_username = identity.get("resolved_username")
-        if not resolved_username:
-            logger.warning(
-                "Missione attiva %s: ignorato username non valido (%s)",
-                mission_id,
-                username,
-            )
-            unresolved_usernames.append(username)
-            continue
-        if (
-            identity.get("match") == "history"
-            and identity.get("original_username")
-            and identity.get("original_username") != resolved_username
-        ):
-            alias_resolved_count += 1
-            logger.info(
-                "Missione attiva %s: alias risolto %s → %s",
-                mission_id,
-                identity.get("original_username"),
-                resolved_username,
-            )
-        resolved_identities.append(identity)
-
-    if not resolved_identities:
-        logger.info("Missione %s: nessun partecipante valido dopo la risoluzione.", mission_id)
-        return
-
-    participant_count = len(resolved_identities)
-
-    mission_type = "Gem" if quest.get("purchasableWithGems", False) else "Gold"
-    if mission_type == "Gold":
-        cost = 500
-    else:
-        if participant_count > 7:
-            cost = 140
-        elif 5 <= participant_count <= 7:
-            cost = 150
-        else:
-            cost = 0
-
-    if cost:
-        for identity in resolved_identities:
-            await update_user_balance(identity["resolved_username"], mission_type, -cost)
-            log_name = identity.get("resolved_username")
-            original = identity.get("original_username")
-            if original and original != log_name:
-                logger.info(
-                    "Dedotto %s %s per %s (alias %s) nella missione %s",
-                    cost,
-                    "Oro" if mission_type == "Gold" else "Gem",
-                    log_name,
-                    original,
-                    mission_id,
-                )
-            else:
-                logger.info(
-                    "Dedotto %s %s per %s nella missione %s",
-                    cost,
-                    "Oro" if mission_type == "Gold" else "Gem",
-                    log_name,
-                    mission_id,
-                )
-    else:
-        logger.info(
-            "Missione attiva %s registrata senza costi aggiuntivi.",
-            mission_id,
-        )
-
-    metadata = {
-        "tier_start_time": tier_start_time,
-        "participants_count": len(raw_usernames),
-        "resolved_participants_count": participant_count,
-        "alias_resolutions": alias_resolved_count,
-        "linked_participants": sum(
-            1 for identity in resolved_identities if identity.get("telegram_id")
-        ),
-        "cost_applied": cost,
-    }
-    if unresolved_usernames:
-        metadata["unresolved_participants"] = unresolved_usernames
-        metadata["unresolved_participants_count"] = len(unresolved_usernames)
-    else:
-        metadata["unresolved_participants_count"] = 0
-
-    participant_entries: List[Dict[str, Any]] = []
-    for identity in resolved_identities:
-        entry: Dict[str, Any] = {
-            "username": identity.get("resolved_username"),
-            "original_username": identity.get("original_username"),
-        }
-        if identity.get("telegram_id") is not None:
-            entry["telegram_id"] = identity.get("telegram_id")
-        if identity.get("telegram_username"):
-            entry["telegram_username"] = identity.get("telegram_username")
-        if identity.get("match"):
-            entry["match"] = identity.get("match")
-        if identity.get("profile_snapshot"):
-            entry["profile_snapshot"] = identity.get("profile_snapshot")
-        participant_entries.append(entry)
-
-    event_id = await db_manager.log_mission_participation(
-        mission_id,
-        mission_type,
-        participant_entries,
-        raw_usernames,
-        cost_per_participant=cost,
-        outcome="auto_processed",
-        source="active_mission",
-        metadata=metadata,
-    )
-
-    await db_manager.mark_active_mission_processed(mission_id, tier_start_time)
-    logger.info(
-        "Missione %s processata e registrata (event_id=%s).",
-        mission_id,
-        event_id or "N/A",
-    )
-
 
 # =============================================================================
 # FUNZIONI HELPER PER FSM E GESTIONE MESSAGGI DI MODIFICA
@@ -1256,42 +421,6 @@ async def fetch_player_by_username(username: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
-async def fetch_player_by_id(
-    player_id: str,
-    *,
-    session: Optional[aiohttp.ClientSession] = None,
-) -> Optional[Dict[str, Any]]:
-    """Recupera un giocatore tramite ID Wolvesville."""
-
-    if not player_id:
-        return None
-
-    url = f"https://api.wolvesville.com/players/{player_id}"
-    headers = {
-        "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-        "Accept": "application/json",
-    }
-
-    async def _do_request(client: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        async with client.get(url, headers=headers) as response:
-            if response.status != 200:
-                logger.warning(
-                    "Impossibile recuperare il giocatore con ID %s (status %s)",
-                    player_id,
-                    response.status,
-                )
-                return None
-            return await response.json()
-
-    try:
-        if session is not None:
-            return await _do_request(session)
-        async with aiohttp.ClientSession() as owned_session:
-            return await _do_request(owned_session)
-    except Exception as exc:
-        logger.error("Errore durante il recupero del giocatore %s: %s", player_id, exc)
-        return None
-
 def chunk_list(items, chunk_size=6):
     """
     Divide una lista in "chunk" (sotto-liste) della dimensione specificata.
@@ -1340,37 +469,22 @@ def add_clan_to_file(clan_id: str, clan_name: str):
 # =============================================================================
 # CONFIGURAZIONE DEL BOT E DEL DISPATCHER
 # =============================================================================
-bot = Bot(
-    token=TOKEN,
-    session=AiohttpSession(),
-    default=DefaultBotProperties(parse_mode="HTML")
+if bot_logger is not None:
+    bot_logger.add_telegram_handler(bot, ADMIN_IDS)
 
-)
-dp = Dispatcher(storage=MemoryStorage())
-
-# Inizializzazione servizio notifiche
-# Initialize notification service
-notification_service = EnhancedNotificationService(
-    bot=bot,
-    admin_ids=ADMIN_IDS,
-    admin_channel_id=ADMIN_NOTIFICATION_CHANNEL,
-    owner_id=OWNER_CHAT_ID
-)
-
-# Setup logging con handler Telegram
-bot_logger.add_telegram_handler(bot, ADMIN_IDS)
-
-# Inizializzazione middleware autorizzazione
-auth_middleware = GroupAuthorizationMiddleware(
-    authorized_groups=set(AUTHORIZED_GROUPS),
-    admin_ids=ADMIN_IDS,
-    notification_service=notification_service
-)
+auth_middleware = None
+if MIDDLEWARE_AVAILABLE:
+    auth_middleware = GroupAuthorizationMiddleware(
+        authorized_groups=set(AUTHORIZED_GROUPS),
+        admin_ids=ADMIN_IDS,
+        notification_service=notification_service,
+    )
 
 # Registrazione middleware nell'ordine corretto
 # IMPORTANTE: Aggiungi PRIMA dei middleware esistenti
 dp.update.middleware(LoggingMiddleware())    # Prima il logging
-dp.update.middleware(auth_middleware)        # Poi l'autorizzazione
+if auth_middleware is not None:
+    dp.update.middleware(auth_middleware)        # Poi l'autorizzazione
 
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
 async def bot_kicked_from_chat(event: ChatMemberUpdated):
@@ -1483,46 +597,22 @@ async def check_user_debts_on_exit(user_data: dict):
 CHAT_ID = -1002383442316  # Sostituisci con l'ID del gruppo desiderato
 TOPIC_ID = 4            # Sostituisci con l'ID del topic specifico
 ADMIN_IDS = [7020291568]
+
+mission_service = MissionService(
+    bot=bot,
+    db_manager=db_manager,
+    identity_service=identity_service,
+    maintenance_service=maintenance_service,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    clan_id=CLAN_ID,
+    logger=logger,
+    clan_chat_id=CHAT_ID,
+    clan_topic_id=TOPIC_ID,
+)
+mission_service.register_handlers(dp)
 # =============================================================================
 # CONFIGURAZIONE DELLO SCHEDULER
 # =============================================================================
-def setup_scheduler():
-    """
-    Configura lo scheduler per eseguire periodicamente alcune funzioni.
-    """
-    scheduler = AsyncIOScheduler(timezone="Europe/Rome")
-
-    # CORREZIONE: Invio skin/messaggi lunedì alle 8:00 (non 11:00)
-    scheduler.add_job(
-        scheduled_mission_skin,
-        "cron",
-        day_of_week="mon",
-        hour=8,  # Cambiato da 11 a 8
-        minute=0,
-        timezone="Europe/Rome"
-    )
-    scheduler.add_job(process_ledger, "interval", minutes=5, next_run_time=datetime.now())
-    scheduler.add_job(process_active_mission_auto, "interval", minutes=5, next_run_time=datetime.now())
-    scheduler.add_job(prepopulate_users, "interval", days=3, next_run_time=datetime.now())
-    scheduler.add_job(
-        refresh_linked_profiles,
-        "interval",
-        minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
-        next_run_time=datetime.now(),
-    )
-
-    # NUOVE funzioni per pulizia e controllo
-    scheduler.add_job(clean_duplicate_users, "interval", hours=24, next_run_time=datetime.now())  # Ogni giorno
-    scheduler.add_job(check_clan_departures, "interval", hours=6, next_run_time=datetime.now())   # Ogni 6 ore
-    # NUOVO: Controllo reminder calendario
-    #scheduler.add_job(calendar_service.check_pending_reminders, "interval", minutes=1)
-
-    # NUOVO: Pulizia log settimanale
-    #scheduler.add_job(cleanup_old_logs, "cron", day_of_week="sun", hour=2, minute=0)
-
-    scheduler.start()
-    logger.info("Scheduler configurato con tutte le funzioni di manutenzione.")
-
 # =============================================================================
 # FUNZIONI VARIE DI SUPPORTO
 # =============================================================================
@@ -1722,82 +812,6 @@ async def handle_mission_callback(callback: types.CallbackQuery, callback_data: 
             logger.error(f"Errore missione Skin: {e}")
             await callback.message.answer("Impossibile recuperare le skin!")
 
-async def scheduled_mission_skin():
-    """
-    Funzione schedulata per inviare automaticamente le skin nella chat.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/available"
-    try:
-        announcement_message = (
-            "🌞 Buongiorno Ragazzi e Ragazze!\n\n"
-            "Qui il bot ad avvisarvi che oggi è **Lunedì**!!\n\n"
-            "Giornata peggiore, ma per fortuna ci sono nuove missioni.\n"
-            "Quindi andate a **votare**! 🗳️🔥"
-        )
-
-        # Invia messaggio nel gruppo
-        await bot.send_message(chat_id=CHAT_ID, text=announcement_message, message_thread_id=TOPIC_ID)
-
-        # Invia annuncio nel gioco
-        url_announcement = f"https://api.wolvesville.com/clans/{CLAN_ID}/announcements"
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            payload = {"message": announcement_message}
-            async with session.post(url_announcement, headers=headers, json=payload) as resp:
-                if resp.status in [200, 201, 204]:
-                    logger.info("Annuncio inviato con successo nel gioco!")
-                else:
-                    response_text = await resp.text()
-                    logger.error(f"Errore nell'invio dell'annuncio: {response_text} (Codice: {resp.status})")
-
-        # CORREZIONE: Invia le skin con variabile corretta
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            resp = await session.get(url, headers=headers)
-            if resp.status != 200:
-                logger.error("Errore nel recupero delle skin programmate")
-                return
-            data = await resp.json()
-            if not data:
-                logger.info("Nessuna skin disponibile per l'invio automatico")
-                return
-
-            for quest in data:
-                promo_url = quest.get("promoImageUrl", "")
-                is_gem = quest.get("purchasableWithGems", False)
-                name = "Sconosciuto"
-                if promo_url:
-                    filename = promo_url.split("/")[-1]
-                    name = filename.split(".")[0]
-                tipo_str = "Gem" if is_gem else "Gold"
-                caption = f"Nome: {name}\nTipo: {tipo_str}"
-
-                try:
-                    async with session.get(promo_url) as r_img:
-                        if r_img.status == 200:
-                            raw = await r_img.read()
-                            # FIX: Correggi la variabile
-                            skin_file = types.BufferedInputFile(raw, filename="skin.png")
-                            await bot.send_photo(
-                                chat_id=CHAT_ID,
-                                photo=skin_file,  # CORREZIONE QUI
-                                caption=caption,
-                                message_thread_id=TOPIC_ID
-                            )
-                except Exception as e:
-                    logger.warning(f"Impossibile inviare {promo_url}: {e}")
-
-    except Exception as e:
-        logger.error(f"Errore nell'invio automatico delle skin: {e}")
-
 # Nuovo helper: send_and_log (se non già definito)
 async def send_and_log(text: str, chat_id: int, reply_markup: types.InlineKeyboardMarkup = None):
     logger.info(f"Sending message to {chat_id}: {text}")
@@ -1931,7 +945,7 @@ async def finalize_profile_link(callback: types.CallbackQuery, state: FSMContext
         await state.clear()
         return
 
-    player_info = await fetch_player_by_id(player_id)
+    player_info = await identity_service.fetch_player_by_id(player_id)
     if not player_info:
         await callback.answer(
             "Non riesco a recuperare il profilo, riprova tra qualche secondo.",
@@ -2145,7 +1159,7 @@ async def handle_menu_callback(callback: types.CallbackQuery, state: FSMContext)
         await show_balances(callback.message)
     elif choice == "partecipanti":
         # Chiamata al flusso per abilitare i partecipanti (equivalente a /partecipanti)
-        await partecipanti_command(callback.message, state)
+        await mission_service.partecipanti_command(callback.message, state)
     elif choice == "help":
         help_text = """<b>🤖 GUIDA COMPLETA BOT CLAN</b>
 
@@ -2211,8 +1225,8 @@ async def manual_cleanup(message: types.Message):
     try:
         loading_msg = await message.answer("🔄 Avvio pulizia database...")
 
-        await clean_duplicate_users()
-        await check_clan_departures()
+        await maintenance_service.clean_duplicate_users()
+        await maintenance_service.check_clan_departures()
 
         await loading_msg.edit_text("✅ Pulizia completata!\n\n🗂️ Duplicati rimossi\n👥 Controllo uscite clan eseguito")
 
@@ -2220,331 +1234,6 @@ async def manual_cleanup(message: types.Message):
         logger.error(f"Errore cleanup manuale: {e}")
         await message.answer("❌ Errore durante la pulizia. Controlla i log.")
 
-
-# =============================================================================
-# NUOVO FLUSSO PER /partecipanti E ABILITAZIONE
-# =============================================================================
-
-# Definizione degli stati per questo flusso
-class MissionStates(StatesGroup):
-    SELECTING_MISSION = State()
-    CONFIRMING_PARTICIPANTS = State()
-
-async def get_available_missions() -> List[Dict]:
-    """
-    Recupera le missioni disponibili tramite GET /quests/available.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/available"
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                missions = await resp.json()
-                return missions
-            else:
-                logger.error(f"Errore nel recupero delle missioni: status {resp.status}")
-                return []
-
-async def get_clan_member_ids(session: Optional[aiohttp.ClientSession] = None) -> List[str]:
-    """Recupera gli ID di tutti i membri del clan per gestire la partecipazione alle missioni."""
-
-    close_session = False
-    members: List[Dict[str, Any]] = []
-
-    if session is None:
-        session = aiohttp.ClientSession()
-        close_session = True
-
-    try:
-        url = f"https://api.wolvesville.com/clans/{CLAN_ID}/members"
-        headers = {
-            "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-            "Accept": "application/json",
-        }
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(
-                    "Errore nel recupero dei membri del clan: status %s, risposta %s",
-                    resp.status,
-                    error_body,
-                )
-                return []
-
-            data = await resp.json()
-            if isinstance(data, list):
-                members = data
-            elif isinstance(data, dict):
-                members_value = data.get("members", [])
-                if isinstance(members_value, list):
-                    members = members_value
-                else:
-                    logger.error("Formato inatteso nella risposta dei membri del clan: %s", data)
-                    return []
-            else:
-                logger.error("Formato inatteso nella risposta dei membri del clan: %s", data)
-                return []
-    except Exception as exc:
-        logger.error("Eccezione durante il recupero dei membri del clan: %s", exc)
-        return []
-    finally:
-        if close_session:
-            await session.close()
-
-    member_ids: List[str] = []
-    for member in members:
-        if not isinstance(member, dict):
-            continue
-
-        member_id = (
-            member.get("playerId")
-            or member.get("id")
-            or member.get("memberId")
-            or member.get("userId")
-        )
-
-        if not member_id:
-            player_data = member.get("player")
-            if isinstance(player_data, dict):
-                member_id = (
-                    player_data.get("playerId")
-                    or player_data.get("id")
-                    or player_data.get("userId")
-                )
-
-        if member_id:
-            member_ids.append(str(member_id))
-        else:
-            logger.warning("Impossibile determinare l'ID per il membro: %s", member)
-
-    unique_member_ids = list(dict.fromkeys(member_ids))
-    if not unique_member_ids:
-        logger.warning("Nessun ID valido trovato nella lista dei membri del clan.")
-
-    return unique_member_ids
-
-
-
-@dp.message(Command("partecipanti"))
-async def partecipanti_command(message: types.Message, state: FSMContext):
-    """
-    Avvia il flusso per abilitare i partecipanti in una missione.
-    1. Ottiene le missioni disponibili.
-    2. Mostra una tastiera con un pulsante per ciascuna missione (utilizzando il nome estratto dal campo promoImageUrl).
-    3. Imposta lo stato in SELECTING_MISSION.
-    """
-    missions = await get_available_missions()
-    if not missions:
-        await message.answer("Nessuna missione disponibile al momento.")
-        return
-    buttons = []
-    for mission in missions:
-        promo_url = mission.get("promoImageUrl", "")
-        name = "Sconosciuto"
-        if promo_url:
-            filename = promo_url.split("/")[-1]
-            name = filename.split(".")[0]
-        mission_id = mission.get("id")
-        buttons.append([InlineKeyboardButton(text=name, callback_data=f"mission_select_{mission_id}")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer("Per quale missione si intende abilitare i partecipanti?", reply_markup=kb)
-    await state.update_data(available_missions=missions)
-    await state.set_state(MissionStates.SELECTING_MISSION)
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("mission_select_"))
-async def mission_select_callback(callback: types.CallbackQuery, state: FSMContext):
-    """
-    Dopo che l'utente seleziona una missione:
-    1. Cancella il messaggio dei pulsanti.
-    2. Richiama GET /quests/votes per ottenere i voti e filtra quelli della missione selezionata.
-    3. Salva la lista dei playerId (voti) nello state.
-    4. Mostra una tastiera con "Si" / "No" per confermare l'abilitazione.
-    """
-    selected_mission_id = callback.data.split("mission_select_")[-1]
-    try:
-        await callback.message.delete()
-    except Exception as e:
-        logger.warning(f"Errore nella cancellazione del messaggio: {e}")
-    votes_url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/votes"
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-        async with session.get(votes_url, headers=headers) as resp:
-            if resp.status != 200:
-                await callback.message.answer("Impossibile recuperare i voti.")
-                return
-            votes_data = await resp.json()
-    # Supponiamo che i voti siano strutturati in un dizionario "votes" dove la chiave è l'id della missione
-    votes_dict = votes_data.get("votes", {})
-    mission_player_ids = votes_dict.get(selected_mission_id, [])
-    logger.info(f"Numero di voti per missione {selected_mission_id}: {len(mission_player_ids)}")
-    await state.update_data(selected_mission_id=selected_mission_id, mission_player_ids=mission_player_ids)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Si", callback_data=f"enable_votes_yes_{selected_mission_id}"),
-         InlineKeyboardButton(text="No", callback_data=f"enable_votes_no_{selected_mission_id}")]
-    ])
-    await callback.message.answer("Vuoi abilitare i partecipanti che hanno votato per questa missione?", reply_markup=kb)
-    await state.set_state(MissionStates.CONFIRMING_PARTICIPANTS)
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("enable_votes_"))
-async def enable_votes_callback(callback: types.CallbackQuery, state: FSMContext):
-    """
-    Se l'utente conferma ("Si"), per ogni playerId salvato nello state viene inviata una richiesta PUT
-    per abilitare la partecipazione, con il payload {"participateInQuests": True}.
-    """
-    parts = callback.data.split("_")
-    decision = parts[2]  # "yes" o "no"
-    try:
-        await callback.message.delete()
-    except Exception as e:
-        logger.warning(f"Errore nella cancellazione del messaggio: {e}")
-    if decision == "yes":
-        data = await state.get_data()
-        mission_player_ids_raw = data.get("mission_player_ids", [])
-        selected_mission_id = data.get("selected_mission_id")
-
-        mission_player_ids = [str(pid) for pid in mission_player_ids_raw]
-        mission_player_ids = list(dict.fromkeys(mission_player_ids))
-        logger.info(
-            "Abilitazione - numero di player unici con voto per la missione %s: %s",
-            selected_mission_id,
-            len(mission_player_ids),
-        )
-        if not mission_player_ids:
-            await callback.message.answer("Nessun player ha votato per questa missione.")
-            await state.clear()
-            return
-        if not selected_mission_id:
-            logger.error("Missione selezionata non trovata nello state dell'FSM.")
-            await callback.message.answer(
-                "Impossibile determinare la missione selezionata. Ripeti l'operazione."
-            )
-            await state.clear()
-            return
-
-        disable_failures: List[str] = []
-        enable_failures: List[str] = []
-        warning_messages: List[str] = []
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                all_member_ids = await get_clan_member_ids(session)
-                json_headers = {
-                    "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                    "Content-Type": "application/json",
-                }
-
-                if all_member_ids:
-                    disable_payload = {"participateInQuests": False}
-                    for member_id in all_member_ids:
-                        url_put_disable = (
-                            f"https://api.wolvesville.com/clans/{CLAN_ID}/members/{member_id}/participateInQuests"
-                        )
-                        async with session.put(
-                            url_put_disable, headers=json_headers, json=disable_payload
-                        ) as resp:
-                            response_text = await resp.text()
-                            logger.info(
-                                "PUT %s -> %s, %s",
-                                url_put_disable,
-                                resp.status,
-                                response_text,
-                            )
-                            if resp.status not in [200, 201, 204]:
-                                disable_failures.append(str(member_id))
-                                logger.error(
-                                    "Errore nella disattivazione del membro %s: status %s, risposta %s",
-                                    member_id,
-                                    resp.status,
-                                    response_text,
-                                )
-                else:
-                    warning_messages.append(
-                        "⚠️ Impossibile recuperare la lista completa dei membri, salto la disattivazione preventiva."
-                    )
-                    logger.warning(
-                        "Lista membri vuota durante la disattivazione preventiva dei partecipanti alla missione."
-                    )
-
-                enable_payload = {"participateInQuests": True}
-                for pid in mission_player_ids:
-                    url_put_enable = (
-                        f"https://api.wolvesville.com/clans/{CLAN_ID}/members/{pid}/participateInQuests"
-                    )
-                    async with session.put(
-                        url_put_enable, headers=json_headers, json=enable_payload
-                    ) as resp:
-                        response_text = await resp.text()
-                        logger.info(
-                            "PUT %s -> %s, %s",
-                            url_put_enable,
-                            resp.status,
-                            response_text,
-                        )
-                        if resp.status not in [200, 201, 204]:
-                            enable_failures.append(str(pid))
-                            logger.error(
-                                "Errore nell'abilitazione del membro %s: status %s, risposta %s",
-                                pid,
-                                resp.status,
-                                response_text,
-                            )
-
-                await callback.message.answer("I partecipanti che hanno votato sono stati abilitati.")
-
-                claim_url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/claim"
-                claim_headers = {
-                    "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                }
-                claim_payload = {"questId": selected_mission_id}
-
-                async with session.post(
-                    claim_url, headers=claim_headers, json=claim_payload
-                ) as resp:
-                    claim_body = await resp.text()
-                    if resp.status in [200, 201, 204]:
-                        await callback.message.answer("🚀 Missione avviata con successo.")
-                        logger.info(
-                            "Missione %s avviata con successo: %s",
-                            selected_mission_id,
-                            claim_body,
-                        )
-                    else:
-                        logger.error(
-                            "Errore nell'avvio della missione %s: status %s, risposta %s",
-                            selected_mission_id,
-                            resp.status,
-                            claim_body,
-                        )
-                        await callback.message.answer(
-                            f"⚠️ Impossibile avviare la missione (status {resp.status})."
-                        )
-
-                for message_text in warning_messages:
-                    await callback.message.answer(message_text)
-
-                if disable_failures:
-                    await callback.message.answer(
-                        f"⚠️ Disattivazione non riuscita per {len(disable_failures)} membri. Controlla i log per i dettagli."
-                    )
-
-                if enable_failures:
-                    await callback.message.answer(
-                        f"⚠️ Abilitazione non riuscita per {len(enable_failures)} partecipanti. Controlla i log per i dettagli."
-                    )
-        except Exception as exc:
-            logger.error(
-                "Errore durante la gestione dell'abilitazione missione per %s: %s",
-                selected_mission_id,
-                exc,
-            )
-            await callback.message.answer(
-                "Si è verificato un errore durante l'abilitazione dei partecipanti. Riprova più tardi."
-            )
-    else:
-        await callback.message.answer("Abilitazione annullata.")
-    await state.clear()
 
 
 """BILANCI """
@@ -3283,9 +1972,16 @@ async def show_members_page(message: types.Message, state: FSMContext):
 # =============================================================================
 async def main():
     maybe_log_public_ip()
-    setup_scheduler()
-    await prepopulate_users()
-    await refresh_linked_profiles()
+    setup_scheduler(
+        scheduler,
+        maintenance_service=maintenance_service,
+        mission_service=mission_service,
+        identity_service=identity_service,
+        profile_auto_sync_minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
+        logger=logger,
+    )
+    await maintenance_service.prepopulate_users()
+    await identity_service.refresh_linked_profiles()
 
     # NUOVO: Notifica avvio bot
     try:
