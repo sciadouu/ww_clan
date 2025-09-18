@@ -103,59 +103,62 @@ class MenuHandlers:
 
     @staticmethod
     def _help_text() -> str:
-        return """<b>🤖 GUIDA COMPLETA BOT CLAN</b>
-
-<b>📌 NAVIGAZIONE RAPIDA</b>
-• <code>/start</code> – Avvia il bot e apre il menu principale interattivo
-• <code>/menu</code> – Richiama in qualsiasi momento le scorciatoie più utilizzate
-• <code>/help</code> – Elenco completo e sempre aggiornato delle funzionalità disponibili
-
-<b>🏆 SISTEMA RICOMPENSE</b>
-• <code>/classifica [periodo]</code> – Classifica dinamica dei punti premio (Top 10).<br>
-&nbsp;&nbsp;<i>Periodi supportati:</i> <code>totale</code>, <code>settimana</code>, <code>mese</code>, <code>oggi</code> e sinonimi.<br>
-&nbsp;&nbsp;<i>Dettagli inclusi:</i> punti del periodo, totale storico e icone degli achievement sbloccati.
-• <code>/progressi &lt;username&gt; [periodo]</code> – Scheda avanzata di un giocatore.<br>
-&nbsp;&nbsp;<i>Mostra:</i> punteggio complessivo, andamento nel periodo scelto, distribuzione per tipologia, ultimi eventi registrati e achievement ottenuti.
-• <i>Classifiche automatiche</i> – Aggiornamenti settimanali e mensili inviati in automatico agli amministratori via notifica.
-• <i>Notifiche achievement</i> – Ogni traguardo attiva un alert dedicato con riepilogo e bonus punti accreditati.
-
-<b>👤 GESTIONE GIOCATORI</b>
-• <i>Membro del Clan</i> – Elenco paginato con dati di profilo, stato online e attività recenti.
-• <i>Ricerca Esterna</i> – Trova qualsiasi giocatore partendo dallo username Wolvesville.
-• <i>Profili Completi</i> – Statistiche, livello, clan di appartenenza e galleria avatar sempre aggiornata.
-• <code>/collega</code> – Collega il profilo Telegram a quello di gioco per sbloccare funzioni avanzate e sincronizzazioni automatiche.
-
-<b>🏰 STRUMENTI CLAN</b>
-• <code>/clan [ID]</code> – Dossier completo su qualsiasi clan (membri, progressi, attività recenti).
-• <i>Clan salvati</i> – Accesso rapido alle ricerche più frequenti effettuate dal bot.
-• <i>Statistiche</i> – Analisi delle risorse condivise, andamento membri e confronto con i periodi precedenti.
-
-<b>⚔️ MISSIONI</b>
-• <i>Skin disponibili</i> – Dettagli missione con immagini, costi e ricompense.
-• <i>Partecipanti</i> – Monitoraggio live dal menu «Player Missione».
-• <i>Skip timer</i> – Riduzione del tempo di attesa (riservata agli admin autorizzati).
-• <i>Supporto missioni</i> – Nuovo sistema premi per chi assiste le squadre durante i raid.
-
-<b>💰 ECONOMIA</b>
-• <code>/balances</code> – Bilancio donazioni suddiviso per valuta e giocatore.
-• <i>Calcoli automatici</i> – Donazioni, costi missione e debiti gestiti in tempo reale.
-• <i>Ledger cronologico</i> – Storico contributi oro/gemme integrato con il sistema ricompense.
-
-<b>🔧 COMANDI ADMIN</b>
-• <code>/cleanup</code> – Rimuove duplicati e sincronizza i dati tra le diverse collezioni MongoDB.
-• <i>Controllo uscite</i> – Notifiche automatiche per chi lascia il clan con debiti pendenti.
-• <i>Monitoraggio gruppi</i> – Alert immediati quando il bot entra in chat non autorizzate (con blacklist automatica).
-
-<b>🔄 AUTOMAZIONI</b>
-• Ledger donazioni ogni 5 minuti
-• Calcolo missioni attive ogni 5 minuti
-• Sincronizzazione profili collegati ogni intervallo configurato
-• Pulizia database ogni 24 ore
-• Controllo uscite ogni 6 ore
-• Classifiche reward settimanali e mensili inviate automaticamente agli admin
-
-<b>💡 SUGGERIMENTI</b>
-• Usa il menu rapido per avviare i flussi guidati principali.
-• Specifica il periodo quando utilizzi <code>/classifica</code> o <code>/progressi</code> per filtrare i risultati.
-• Gli achievement sbloccati garantiscono punti bonus immediati registrati nello storico premi.
-• I comandi admin richiedono autorizzazioni dedicate: contatta il responsabile del clan per l'abilitazione."""
+        sections = [
+            "<b>🤖 GUIDA COMPLETA BOT CLAN</b>",
+            "",
+            "<b>📌 NAVIGAZIONE RAPIDA</b>",
+            "• <code>/start</code> – Avvia il bot e apre il menu principale interattivo",
+            "• <code>/menu</code> – Richiama in qualsiasi momento le scorciatoie più utilizzate",
+            "• <code>/help</code> – Elenco completo e sempre aggiornato delle funzionalità disponibili",
+            "",
+            "<b>🏆 SISTEMA RICOMPENSE</b>",
+            "• <code>/classifica [periodo]</code> – Classifica dinamica dei punti premio (Top 10).",
+            "  <i>Periodi supportati:</i> <code>totale</code>, <code>settimana</code>, <code>mese</code>, <code>oggi</code> e sinonimi.",
+            "  <i>Dettagli inclusi:</i> punti del periodo, totale storico e icone degli achievement sbloccati.",
+            "• <code>/progressi &lt;username&gt; [periodo]</code> – Scheda avanzata di un giocatore.",
+            "  <i>Mostra:</i> punteggio complessivo, andamento nel periodo scelto, distribuzione per tipologia, ultimi eventi registrati e achievement ottenuti.",
+            "• <i>Classifiche automatiche</i> – Aggiornamenti settimanali e mensili inviati in automatico agli amministratori via notifica.",
+            "• <i>Notifiche achievement</i> – Ogni traguardo attiva un alert dedicato con riepilogo e bonus punti accreditati.",
+            "",
+            "<b>👤 GESTIONE GIOCATORI</b>",
+            "• <i>Membro del Clan</i> – Elenco paginato con dati di profilo, stato online e attività recenti.",
+            "• <i>Ricerca Esterna</i> – Trova qualsiasi giocatore partendo dallo username Wolvesville.",
+            "• <i>Profili Completi</i> – Statistiche, livello, clan di appartenenza e galleria avatar sempre aggiornata.",
+            "• <code>/collega</code> – Collega il profilo Telegram a quello di gioco per sbloccare funzioni avanzate e sincronizzazioni automatiche.",
+            "",
+            "<b>🏰 STRUMENTI CLAN</b>",
+            "• <code>/clan [ID]</code> – Dossier completo su qualsiasi clan (membri, progressi, attività recenti).",
+            "• <i>Clan salvati</i> – Accesso rapido alle ricerche più frequenti effettuate dal bot.",
+            "• <i>Statistiche</i> – Analisi delle risorse condivise, andamento membri e confronto con i periodi precedenti.",
+            "",
+            "<b>⚔️ MISSIONI</b>",
+            "• <i>Skin disponibili</i> – Dettagli missione con immagini, costi e ricompense.",
+            "• <i>Partecipanti</i> – Monitoraggio live dal menu «Player Missione».",
+            "• <i>Skip timer</i> – Riduzione del tempo di attesa (riservata agli admin autorizzati).",
+            "• <i>Supporto missioni</i> – Nuovo sistema premi per chi assiste le squadre durante i raid.",
+            "",
+            "<b>💰 ECONOMIA</b>",
+            "• <code>/balances</code> – Bilancio donazioni suddiviso per valuta e giocatore.",
+            "• <i>Calcoli automatici</i> – Donazioni, costi missione e debiti gestiti in tempo reale.",
+            "• <i>Ledger cronologico</i> – Storico contributi oro/gemme integrato con il sistema ricompense.",
+            "",
+            "<b>🔧 COMANDI ADMIN</b>",
+            "• <code>/cleanup</code> – Rimuove duplicati e sincronizza i dati tra le diverse collezioni MongoDB.",
+            "• <i>Controllo uscite</i> – Notifiche automatiche per chi lascia il clan con debiti pendenti.",
+            "• <i>Monitoraggio gruppi</i> – Alert immediati quando il bot entra in chat non autorizzate (con blacklist automatica).",
+            "",
+            "<b>🔄 AUTOMAZIONI</b>",
+            "• Ledger donazioni ogni 5 minuti",
+            "• Calcolo missioni attive ogni 5 minuti",
+            "• Sincronizzazione profili collegati ogni intervallo configurato",
+            "• Pulizia database ogni 24 ore",
+            "• Controllo uscite ogni 6 ore",
+            "• Classifiche reward settimanali e mensili inviate automaticamente agli admin",
+            "",
+            "<b>💡 SUGGERIMENTI</b>",
+            "• Usa il menu rapido per avviare i flussi guidati principali.",
+            "• Specifica il periodo quando utilizzi <code>/classifica</code> o <code>/progressi</code> per filtrare i risultati.",
+            "• Gli achievement sbloccati garantiscono punti bonus immediati registrati nello storico premi.",
+            "• I comandi admin richiedono autorizzazioni dedicate: contatta il responsabile del clan per l'abilitazione.",
+        ]
+        return "\n".join(sections)

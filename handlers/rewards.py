@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from aiogram import Router, types
@@ -17,6 +17,7 @@ class RewardHandlers:
 
     reward_service: RewardService
     logger: Any
+    router: Router = field(init=False)
 
     def __post_init__(self) -> None:
         self.router = Router()

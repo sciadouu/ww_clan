@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -27,6 +27,11 @@ class RewardService:
     repository: RewardsRepository
     notification_service: Optional[EnhancedNotificationService] = None
     logger: Any = None
+    _local_tz: ZoneInfo = field(init=False, repr=False)
+    POINTS_CONFIG: Dict[str, Dict[str, Any]] = field(init=False)
+    POINT_TYPE_ALIASES: Dict[str, str] = field(init=False)
+    _period_aliases: Dict[str, Dict[str, Any]] = field(init=False, repr=False)
+    ACHIEVEMENTS: Dict[str, Dict[str, Any]] = field(init=False)
 
     def __post_init__(self) -> None:
         self.logger = self.logger or logging.getLogger(__name__)
