@@ -33,6 +33,10 @@ from services.identity_service import (
     format_telegram_username,
 )
 from services.maintenance_service import MaintenanceService
+from services.mission_service import MissionService
+from services.notification_service import EnhancedNotificationService, NotificationType
+from bot_app import create_app_context
+from bot_app.scheduler import setup_scheduler
 from services.notification_service import EnhancedNotificationService, NotificationType
 from bot_app import create_app_context
 from config import (
@@ -910,6 +914,19 @@ async def check_user_debts_on_exit(user_data: dict):
 CHAT_ID = -1002383442316  # Sostituisci con l'ID del gruppo desiderato
 TOPIC_ID = 4            # Sostituisci con l'ID del topic specifico
 ADMIN_IDS = [7020291568]
+
+mission_service = MissionService(
+    bot=bot,
+    db_manager=db_manager,
+    identity_service=identity_service,
+    maintenance_service=maintenance_service,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    clan_id=CLAN_ID,
+    logger=logger,
+    clan_chat_id=CHAT_ID,
+    clan_topic_id=TOPIC_ID,
+)
+mission_service.register_handlers(dp)
 # =============================================================================
 # CONFIGURAZIONE DELLO SCHEDULER
 # =============================================================================
@@ -1167,82 +1184,6 @@ async def handle_mission_callback(callback: types.CallbackQuery, callback_data: 
         except Exception as e:
             logger.error(f"Errore missione Skin: {e}")
             await callback.message.answer("Impossibile recuperare le skin!")
-
-async def scheduled_mission_skin():
-    """
-    Funzione schedulata per inviare automaticamente le skin nella chat.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/available"
-    try:
-        announcement_message = (
-            "🌞 Buongiorno Ragazzi e Ragazze!\n\n"
-            "Qui il bot ad avvisarvi che oggi è **Lunedì**!!\n\n"
-            "Giornata peggiore, ma per fortuna ci sono nuove missioni.\n"
-            "Quindi andate a **votare**! 🗳️🔥"
-        )
-
-        # Invia messaggio nel gruppo
-        await bot.send_message(chat_id=CHAT_ID, text=announcement_message, message_thread_id=TOPIC_ID)
-
-        # Invia annuncio nel gioco
-        url_announcement = f"https://api.wolvesville.com/clans/{CLAN_ID}/announcements"
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            payload = {"message": announcement_message}
-            async with session.post(url_announcement, headers=headers, json=payload) as resp:
-                if resp.status in [200, 201, 204]:
-                    logger.info("Annuncio inviato con successo nel gioco!")
-                else:
-                    response_text = await resp.text()
-                    logger.error(f"Errore nell'invio dell'annuncio: {response_text} (Codice: {resp.status})")
-
-        # CORREZIONE: Invia le skin con variabile corretta
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            resp = await session.get(url, headers=headers)
-            if resp.status != 200:
-                logger.error("Errore nel recupero delle skin programmate")
-                return
-            data = await resp.json()
-            if not data:
-                logger.info("Nessuna skin disponibile per l'invio automatico")
-                return
-
-            for quest in data:
-                promo_url = quest.get("promoImageUrl", "")
-                is_gem = quest.get("purchasableWithGems", False)
-                name = "Sconosciuto"
-                if promo_url:
-                    filename = promo_url.split("/")[-1]
-                    name = filename.split(".")[0]
-                tipo_str = "Gem" if is_gem else "Gold"
-                caption = f"Nome: {name}\nTipo: {tipo_str}"
-
-                try:
-                    async with session.get(promo_url) as r_img:
-                        if r_img.status == 200:
-                            raw = await r_img.read()
-                            # FIX: Correggi la variabile
-                            skin_file = types.BufferedInputFile(raw, filename="skin.png")
-                            await bot.send_photo(
-                                chat_id=CHAT_ID,
-                                photo=skin_file,  # CORREZIONE QUI
-                                caption=caption,
-                                message_thread_id=TOPIC_ID
-                            )
-                except Exception as e:
-                    logger.warning(f"Impossibile inviare {promo_url}: {e}")
-
-    except Exception as e:
-        logger.error(f"Errore nell'invio automatico delle skin: {e}")
 
 # Nuovo helper: send_and_log (se non già definito)
 async def send_and_log(text: str, chat_id: int, reply_markup: types.InlineKeyboardMarkup = None):
@@ -1591,7 +1532,7 @@ async def handle_menu_callback(callback: types.CallbackQuery, state: FSMContext)
         await show_balances(callback.message)
     elif choice == "partecipanti":
         # Chiamata al flusso per abilitare i partecipanti (equivalente a /partecipanti)
-        await partecipanti_command(callback.message, state)
+        await mission_service.partecipanti_command(callback.message, state)
     elif choice == "help":
         help_text = """<b>🤖 GUIDA COMPLETA BOT CLAN</b>
 
@@ -1666,331 +1607,6 @@ async def manual_cleanup(message: types.Message):
         logger.error(f"Errore cleanup manuale: {e}")
         await message.answer("❌ Errore durante la pulizia. Controlla i log.")
 
-
-# =============================================================================
-# NUOVO FLUSSO PER /partecipanti E ABILITAZIONE
-# =============================================================================
-
-# Definizione degli stati per questo flusso
-class MissionStates(StatesGroup):
-    SELECTING_MISSION = State()
-    CONFIRMING_PARTICIPANTS = State()
-
-async def get_available_missions() -> List[Dict]:
-    """
-    Recupera le missioni disponibili tramite GET /quests/available.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/available"
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                missions = await resp.json()
-                return missions
-            else:
-                logger.error(f"Errore nel recupero delle missioni: status {resp.status}")
-                return []
-
-async def get_clan_member_ids(session: Optional[aiohttp.ClientSession] = None) -> List[str]:
-    """Recupera gli ID di tutti i membri del clan per gestire la partecipazione alle missioni."""
-
-    close_session = False
-    members: List[Dict[str, Any]] = []
-
-    if session is None:
-        session = aiohttp.ClientSession()
-        close_session = True
-
-    try:
-        url = f"https://api.wolvesville.com/clans/{CLAN_ID}/members"
-        headers = {
-            "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-            "Accept": "application/json",
-        }
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                logger.error(
-                    "Errore nel recupero dei membri del clan: status %s, risposta %s",
-                    resp.status,
-                    error_body,
-                )
-                return []
-
-            data = await resp.json()
-            if isinstance(data, list):
-                members = data
-            elif isinstance(data, dict):
-                members_value = data.get("members", [])
-                if isinstance(members_value, list):
-                    members = members_value
-                else:
-                    logger.error("Formato inatteso nella risposta dei membri del clan: %s", data)
-                    return []
-            else:
-                logger.error("Formato inatteso nella risposta dei membri del clan: %s", data)
-                return []
-    except Exception as exc:
-        logger.error("Eccezione durante il recupero dei membri del clan: %s", exc)
-        return []
-    finally:
-        if close_session:
-            await session.close()
-
-    member_ids: List[str] = []
-    for member in members:
-        if not isinstance(member, dict):
-            continue
-
-        member_id = (
-            member.get("playerId")
-            or member.get("id")
-            or member.get("memberId")
-            or member.get("userId")
-        )
-
-        if not member_id:
-            player_data = member.get("player")
-            if isinstance(player_data, dict):
-                member_id = (
-                    player_data.get("playerId")
-                    or player_data.get("id")
-                    or player_data.get("userId")
-                )
-
-        if member_id:
-            member_ids.append(str(member_id))
-        else:
-            logger.warning("Impossibile determinare l'ID per il membro: %s", member)
-
-    unique_member_ids = list(dict.fromkeys(member_ids))
-    if not unique_member_ids:
-        logger.warning("Nessun ID valido trovato nella lista dei membri del clan.")
-
-    return unique_member_ids
-
-
-
-@dp.message(Command("partecipanti"))
-async def partecipanti_command(message: types.Message, state: FSMContext):
-    """
-    Avvia il flusso per abilitare i partecipanti in una missione.
-    1. Ottiene le missioni disponibili.
-    2. Mostra una tastiera con un pulsante per ciascuna missione (utilizzando il nome estratto dal campo promoImageUrl).
-    3. Imposta lo stato in SELECTING_MISSION.
-    """
-    missions = await get_available_missions()
-    if not missions:
-        await message.answer("Nessuna missione disponibile al momento.")
-        return
-    buttons = []
-    for mission in missions:
-        promo_url = mission.get("promoImageUrl", "")
-        name = "Sconosciuto"
-        if promo_url:
-            filename = promo_url.split("/")[-1]
-            name = filename.split(".")[0]
-        mission_id = mission.get("id")
-        buttons.append([InlineKeyboardButton(text=name, callback_data=f"mission_select_{mission_id}")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer("Per quale missione si intende abilitare i partecipanti?", reply_markup=kb)
-    await state.update_data(available_missions=missions)
-    await state.set_state(MissionStates.SELECTING_MISSION)
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("mission_select_"))
-async def mission_select_callback(callback: types.CallbackQuery, state: FSMContext):
-    """
-    Dopo che l'utente seleziona una missione:
-    1. Cancella il messaggio dei pulsanti.
-    2. Richiama GET /quests/votes per ottenere i voti e filtra quelli della missione selezionata.
-    3. Salva la lista dei playerId (voti) nello state.
-    4. Mostra una tastiera con "Si" / "No" per confermare l'abilitazione.
-    """
-    selected_mission_id = callback.data.split("mission_select_")[-1]
-    try:
-        await callback.message.delete()
-    except Exception as e:
-        logger.warning(f"Errore nella cancellazione del messaggio: {e}")
-    votes_url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/votes"
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-        async with session.get(votes_url, headers=headers) as resp:
-            if resp.status != 200:
-                await callback.message.answer("Impossibile recuperare i voti.")
-                return
-            votes_data = await resp.json()
-    # Supponiamo che i voti siano strutturati in un dizionario "votes" dove la chiave è l'id della missione
-    votes_dict = votes_data.get("votes", {})
-    mission_player_ids = votes_dict.get(selected_mission_id, [])
-    logger.info(f"Numero di voti per missione {selected_mission_id}: {len(mission_player_ids)}")
-    await state.update_data(selected_mission_id=selected_mission_id, mission_player_ids=mission_player_ids)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Si", callback_data=f"enable_votes_yes_{selected_mission_id}"),
-         InlineKeyboardButton(text="No", callback_data=f"enable_votes_no_{selected_mission_id}")]
-    ])
-    await callback.message.answer("Vuoi abilitare i partecipanti che hanno votato per questa missione?", reply_markup=kb)
-    await state.set_state(MissionStates.CONFIRMING_PARTICIPANTS)
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("enable_votes_"))
-async def enable_votes_callback(callback: types.CallbackQuery, state: FSMContext):
-    """
-    Se l'utente conferma ("Si"), per ogni playerId salvato nello state viene inviata una richiesta PUT
-    per abilitare la partecipazione, con il payload {"participateInQuests": True}.
-    """
-    parts = callback.data.split("_")
-    decision = parts[2]  # "yes" o "no"
-    try:
-        await callback.message.delete()
-    except Exception as e:
-        logger.warning(f"Errore nella cancellazione del messaggio: {e}")
-    if decision == "yes":
-        data = await state.get_data()
-        mission_player_ids_raw = data.get("mission_player_ids", [])
-        selected_mission_id = data.get("selected_mission_id")
-
-        mission_player_ids = [str(pid) for pid in mission_player_ids_raw]
-        mission_player_ids = list(dict.fromkeys(mission_player_ids))
-        logger.info(
-            "Abilitazione - numero di player unici con voto per la missione %s: %s",
-            selected_mission_id,
-            len(mission_player_ids),
-        )
-        if not mission_player_ids:
-            await callback.message.answer("Nessun player ha votato per questa missione.")
-            await state.clear()
-            return
-        if not selected_mission_id:
-            logger.error("Missione selezionata non trovata nello state dell'FSM.")
-            await callback.message.answer(
-                "Impossibile determinare la missione selezionata. Ripeti l'operazione."
-            )
-            await state.clear()
-            return
-
-        disable_failures: List[str] = []
-        enable_failures: List[str] = []
-        warning_messages: List[str] = []
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                all_member_ids = await get_clan_member_ids(session)
-                json_headers = {
-                    "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                    "Content-Type": "application/json",
-                }
-
-                if all_member_ids:
-                    disable_payload = {"participateInQuests": False}
-                    for member_id in all_member_ids:
-                        url_put_disable = (
-                            f"https://api.wolvesville.com/clans/{CLAN_ID}/members/{member_id}/participateInQuests"
-                        )
-                        async with session.put(
-                            url_put_disable, headers=json_headers, json=disable_payload
-                        ) as resp:
-                            response_text = await resp.text()
-                            logger.info(
-                                "PUT %s -> %s, %s",
-                                url_put_disable,
-                                resp.status,
-                                response_text,
-                            )
-                            if resp.status not in [200, 201, 204]:
-                                disable_failures.append(str(member_id))
-                                logger.error(
-                                    "Errore nella disattivazione del membro %s: status %s, risposta %s",
-                                    member_id,
-                                    resp.status,
-                                    response_text,
-                                )
-                else:
-                    warning_messages.append(
-                        "⚠️ Impossibile recuperare la lista completa dei membri, salto la disattivazione preventiva."
-                    )
-                    logger.warning(
-                        "Lista membri vuota durante la disattivazione preventiva dei partecipanti alla missione."
-                    )
-
-                enable_payload = {"participateInQuests": True}
-                for pid in mission_player_ids:
-                    url_put_enable = (
-                        f"https://api.wolvesville.com/clans/{CLAN_ID}/members/{pid}/participateInQuests"
-                    )
-                    async with session.put(
-                        url_put_enable, headers=json_headers, json=enable_payload
-                    ) as resp:
-                        response_text = await resp.text()
-                        logger.info(
-                            "PUT %s -> %s, %s",
-                            url_put_enable,
-                            resp.status,
-                            response_text,
-                        )
-                        if resp.status not in [200, 201, 204]:
-                            enable_failures.append(str(pid))
-                            logger.error(
-                                "Errore nell'abilitazione del membro %s: status %s, risposta %s",
-                                pid,
-                                resp.status,
-                                response_text,
-                            )
-
-                await callback.message.answer("I partecipanti che hanno votato sono stati abilitati.")
-
-                claim_url = f"https://api.wolvesville.com/clans/{CLAN_ID}/quests/claim"
-                claim_headers = {
-                    "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                }
-                claim_payload = {"questId": selected_mission_id}
-
-                async with session.post(
-                    claim_url, headers=claim_headers, json=claim_payload
-                ) as resp:
-                    claim_body = await resp.text()
-                    if resp.status in [200, 201, 204]:
-                        await callback.message.answer("🚀 Missione avviata con successo.")
-                        logger.info(
-                            "Missione %s avviata con successo: %s",
-                            selected_mission_id,
-                            claim_body,
-                        )
-                    else:
-                        logger.error(
-                            "Errore nell'avvio della missione %s: status %s, risposta %s",
-                            selected_mission_id,
-                            resp.status,
-                            claim_body,
-                        )
-                        await callback.message.answer(
-                            f"⚠️ Impossibile avviare la missione (status {resp.status})."
-                        )
-
-                for message_text in warning_messages:
-                    await callback.message.answer(message_text)
-
-                if disable_failures:
-                    await callback.message.answer(
-                        f"⚠️ Disattivazione non riuscita per {len(disable_failures)} membri. Controlla i log per i dettagli."
-                    )
-
-                if enable_failures:
-                    await callback.message.answer(
-                        f"⚠️ Abilitazione non riuscita per {len(enable_failures)} partecipanti. Controlla i log per i dettagli."
-                    )
-        except Exception as exc:
-            logger.error(
-                "Errore durante la gestione dell'abilitazione missione per %s: %s",
-                selected_mission_id,
-                exc,
-            )
-            await callback.message.answer(
-                "Si è verificato un errore durante l'abilitazione dei partecipanti. Riprova più tardi."
-            )
-    else:
-        await callback.message.answer("Abilitazione annullata.")
-    await state.clear()
 
 
 """BILANCI """
@@ -2729,6 +2345,16 @@ async def show_members_page(message: types.Message, state: FSMContext):
 # =============================================================================
 async def main():
     maybe_log_public_ip()
+    setup_scheduler(
+        scheduler,
+        maintenance_service=maintenance_service,
+        mission_service=mission_service,
+        identity_service=identity_service,
+        profile_auto_sync_minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
+        logger=logger,
+    )
+    await maintenance_service.prepopulate_users()
+    await identity_service.refresh_linked_profiles()
     setup_scheduler(scheduler)
     await maintenance_service.prepopulate_users()
     await identity_service.refresh_linked_profiles()
