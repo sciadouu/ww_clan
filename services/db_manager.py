@@ -29,6 +29,7 @@ class MongoManager:
         self.donation_history_col: AsyncIOMotorCollection = self._database["donation_history"]
         self.missions_history_col: AsyncIOMotorCollection = self._database["missions_history"]
         self.player_profiles_col: AsyncIOMotorCollection = self._database["player_profiles"]
+        self.rewards_history_col: AsyncIOMotorCollection = self._database["rewards_history"]
 
     @property
     def database(self) -> AsyncIOMotorDatabase:
