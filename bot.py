@@ -1,20 +1,19 @@
-# =============================================================================
-# IMPORT SECTION
-# =============================================================================
-# Librerie standard
+"""Entry point for Wolvesville clan bot."""
+
+from __future__ import annotations
+
 import asyncio
 import logging
-import math
-import json
 import os
-import secrets
-from datetime import datetime, timezone
-from io import BytesIO
-from typing import List, Dict, Any, Optional
-from urllib.parse import quote_plus
+from typing import Optional
 
-# Librerie di terze parti
 import requests
+from aiogram import types
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram.filters import Command
+
+from bot_app import create_app_context
+from bot_app.scheduler import setup_scheduler
 import aiohttp
 from PIL import Image
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -40,50 +39,60 @@ from bot_app.scheduler import setup_scheduler
 from services.notification_service import EnhancedNotificationService, NotificationType
 from bot_app import create_app_context
 from config import (
+    ADMIN_IDS,
+    ADMIN_NOTIFICATION_CHANNEL,
+    AUTHORIZED_GROUPS,
+    CLAN_ID,
+    OWNER_CHAT_ID,
+    SKIP_IMAGE_PATH,
     TOKEN,
     WOLVESVILLE_API_KEY,
-    CLAN_ID,
-    SKIP_IMAGE_PATH,
-    BOT_PASSWORD,
-    AUTHORIZED_GROUPS,
-    OWNER_CHAT_ID,
-    ADMIN_NOTIFICATION_CHANNEL,
-    ADMIN_IDS,
 )
-# Import moduli settimana 1 con gestione errori
+from handlers import register_user_flow_handlers
+from services.identity_service import IdentityService
+from services.maintenance_service import MaintenanceService
+from services.mission_service import MissionService
+from services.notification_service import (
+    EnhancedNotificationService,
+    NotificationType,
+)
+
 try:
     from middleware.auth_middleware import GroupAuthorizationMiddleware
-    from services.notification_service import NotificationService
+
     MIDDLEWARE_AVAILABLE = True
-except ImportError as e:
+except ImportError as exc:  # pragma: no cover - middleware opzionale
+    print(f"⚠️ GroupAuthorizationMiddleware non disponibile: {exc}")
+    GroupAuthorizationMiddleware = None  # type: ignore
     MIDDLEWARE_AVAILABLE = False
 
-    # Import bot_logger con controlli multipli
 bot_logger = None
 try:
     from utils.logger import bot_logger as imported_bot_logger
+
     if imported_bot_logger is not None:
         bot_logger = imported_bot_logger
         print("✅ bot_logger importato dalla utils.logger")
     else:
         print("⚠️ bot_logger è None dopo import")
-except ImportError as e:
-    print(f"❌ ImportError bot_logger: {e}")
-    bot_logger = None
-# =============================================================================
-# CONFIGURAZIONE LOGGING E VARIABILI GLOBALI
-# =============================================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+except ImportError as exc:  # pragma: no cover - solo log
+    print(f"❌ ImportError bot_logger: {exc}")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-notification_service: Optional[EnhancedNotificationService] = None
-
 LOG_PUBLIC_IP = os.getenv("LOG_PUBLIC_IP", "false").lower() in {"1", "true", "yes", "on"}
-
 PROFILE_AUTO_SYNC_INTERVAL_MINUTES = int(
     os.getenv("PROFILE_AUTO_SYNC_INTERVAL_MINUTES", "15")
 )
 
+notification_service: Optional[EnhancedNotificationService] = None
+identity_service: Optional[IdentityService] = None
+maintenance_service: Optional[MaintenanceService] = None
+mission_service: Optional[MissionService] = None
 
 def maybe_log_public_ip() -> None:
     """Recupera e registra l'IP pubblico solo quando esplicitamente richiesto."""
@@ -94,14 +103,13 @@ def maybe_log_public_ip() -> None:
     try:
         response = requests.get("https://ifconfig.me/ip", timeout=5)
         response.raise_for_status()
-    except requests.RequestException as exc:
+    except requests.RequestException as exc:  # pragma: no cover - log difensivo
         logger.warning("Impossibile recuperare l'IP pubblico: %s", exc)
         return
 
     public_ip = response.text.strip()
     if public_ip:
         logger.info("IP pubblico del bot: %s", public_ip)
-
 
 def schedule_admin_notification(
     message: str,
@@ -116,6 +124,7 @@ def schedule_admin_notification(
 
     async def _send() -> None:
         try:
+            assert notification_service is not None
             await notification_service.send_admin_notification(
                 message,
                 notification_type=notification_type,
@@ -126,10 +135,12 @@ def schedule_admin_notification(
 
     try:
         asyncio.create_task(_send())
-    except RuntimeError:
+    except RuntimeError:  # pragma: no cover - loop non attivo
         logger.warning(
             "Loop asyncio non attivo: impossibile pianificare la notifica admin immediatamente."
         )
+
+
 # =============================================================================
 # CONFIGURAZIONE DI MONGODB
 # =============================================================================
@@ -178,19 +189,43 @@ RESET_TIME = datetime.now(timezone.utc)
 # MIDDLEWARE PER LOGGING
 # =============================================================================
 class LoggingMiddleware(BaseMiddleware):
+    """Registra i messaggi in ingresso e sincronizza i profili Telegram."""
+
     async def __call__(self, handler, event, data):
-        if isinstance(event, Message):
+        if isinstance(event, types.Message):
             chat_id = event.chat.id
             thread_id = event.message_thread_id if event.is_topic_message else None
             user_id = event.from_user.id
             text = event.text if event.text else "<Non testuale>"
-            logger.info(f"Messaggio ricevuto | Chat ID: {chat_id} | Thread ID: {thread_id} | Utente ID: {user_id} | Testo: {text}")
+            logger.info(
+                "Messaggio ricevuto | Chat ID: %s | Thread ID: %s | Utente ID: %s | Testo: %s",
+                chat_id,
+                thread_id,
+                user_id,
+                text,
+            )
             try:
+                if identity_service is not None:
+                    await identity_service.ensure_telegram_profile_synced(event.from_user)
                 await identity_service.ensure_telegram_profile_synced(event.from_user)
             except Exception as exc:  # pragma: no cover - evitare crash middleware
                 logger.warning("Sync profilo Telegram fallita per %s: %s", user_id, exc)
         return await handler(event, data)
 
+
+async def manual_cleanup(message: types.Message) -> None:
+    """Comando manuale per admin per pulire duplicati e controllare uscite clan."""
+
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Non hai i permessi per questo comando.")
+        return
+
+    if maintenance_service is None:
+        await message.answer("❌ Servizio di manutenzione non disponibile.")
+        return
+
+    try:
+        loading_msg = await message.answer("🔄 Avvio pulizia database...")
 class UpdateLoggingMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         logger.info(f"Update RAW => {event}")
@@ -326,24 +361,15 @@ async def process_mission(
             entry["profile_snapshot"] = identity.get("profile_snapshot")
         participant_entries.append(entry)
 
-    event_id = await db_manager.log_mission_participation(
-        mission_id,
-        mission_type,
-        participant_entries,
-        participants,
-        cost_per_participant=cost,
-        outcome=outcome,
-        source=source,
-        metadata=metadata_payload,
-    )
+        await maintenance_service.clean_duplicate_users()
+        await maintenance_service.check_clan_departures()
 
-    if event_id:
-        logger.info(
-            "Registrata partecipazione missione %s (event_id=%s) con %s partecipanti.",
-            mission_id or "manual",
-            event_id,
-            participant_count,
+        await loading_msg.edit_text(
+            "✅ Pulizia completata!\n\n🗂️ Duplicati rimossi\n👥 Controllo uscite clan eseguito"
         )
+    except Exception as exc:  # pragma: no cover - solo log
+        logger.error("Errore cleanup manuale: %s", exc)
+        await message.answer("❌ Errore durante la pulizia. Controlla i log.")
 
     return event_id
 
@@ -419,19 +445,18 @@ async def process_active_mission_auto():
         logger.info("Missione %s: nessun partecipante valido dopo la risoluzione.", mission_id)
         return
 
-    participant_count = len(resolved_identities)
+def configure_middlewares(dispatcher) -> None:
+    """Registra i middleware applicativi sul dispatcher."""
 
-    mission_type = "Gem" if quest.get("purchasableWithGems", False) else "Gold"
-    if mission_type == "Gold":
-        cost = 500
-    else:
-        if participant_count > 7:
-            cost = 140
-        elif 5 <= participant_count <= 7:
-            cost = 150
-        else:
-            cost = 0
+    if bot_logger is not None:
+        bot_logger.add_telegram_handler(bot, ADMIN_IDS)
 
+    auth_middleware = None
+    if MIDDLEWARE_AVAILABLE and GroupAuthorizationMiddleware is not None:
+        auth_middleware = GroupAuthorizationMiddleware(
+            authorized_groups=set(AUTHORIZED_GROUPS),
+            admin_ids=ADMIN_IDS,
+            notification_service=notification_service,
     if cost:
         for identity in resolved_identities:
             await maintenance_service.update_user_balance(
@@ -462,263 +487,104 @@ async def process_active_mission_auto():
             mission_id,
         )
 
-    metadata = {
-        "tier_start_time": tier_start_time,
-        "participants_count": len(raw_usernames),
-        "resolved_participants_count": participant_count,
-        "alias_resolutions": alias_resolved_count,
-        "linked_participants": sum(
-            1 for identity in resolved_identities if identity.get("telegram_id")
-        ),
-        "cost_applied": cost,
-    }
-    if unresolved_usernames:
-        metadata["unresolved_participants"] = unresolved_usernames
-        metadata["unresolved_participants_count"] = len(unresolved_usernames)
-    else:
-        metadata["unresolved_participants_count"] = 0
+    dispatcher.update.middleware(LoggingMiddleware())
+    if auth_middleware is not None:
+        dispatcher.update.middleware(auth_middleware)
 
-    participant_entries: List[Dict[str, Any]] = []
-    for identity in resolved_identities:
-        entry: Dict[str, Any] = {
-            "username": identity.get("resolved_username"),
-            "original_username": identity.get("original_username"),
-        }
-        if identity.get("telegram_id") is not None:
-            entry["telegram_id"] = identity.get("telegram_id")
-        if identity.get("telegram_username"):
-            entry["telegram_username"] = identity.get("telegram_username")
-        if identity.get("match"):
-            entry["match"] = identity.get("match")
-        if identity.get("profile_snapshot"):
-            entry["profile_snapshot"] = identity.get("profile_snapshot")
-        participant_entries.append(entry)
 
-    event_id = await db_manager.log_mission_participation(
-        mission_id,
-        mission_type,
-        participant_entries,
-        raw_usernames,
-        cost_per_participant=cost,
-        outcome="auto_processed",
-        source="active_mission",
-        metadata=metadata,
+app_context = create_app_context(
+    token=TOKEN,
+    mongo_uri="mongodb+srv://Admin:X3TaVDKSSQDcfUG@wolvesville.6mrnmcn.mongodb.net/?retryWrites=true&w=majority&appName=Wolvesville",
+    database_name="Wolvesville",
+    admin_ids=ADMIN_IDS,
+    admin_channel_id=ADMIN_NOTIFICATION_CHANNEL,
+    owner_id=OWNER_CHAT_ID,
+)
+
+bot = app_context.bot
+dp = app_context.dispatcher
+notification_service = app_context.notification_service
+db_manager = app_context.db_manager
+scheduler = app_context.scheduler
+
+identity_service = IdentityService(
+    bot=bot,
+    db_manager=db_manager,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    schedule_admin_notification=schedule_admin_notification,
+    logger=logger,
+)
+
+maintenance_service = MaintenanceService(
+    bot=bot,
+    db_manager=db_manager,
+    identity_service=identity_service,
+    clan_id=CLAN_ID,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    admin_ids=ADMIN_IDS,
+    logger=logger,
+)
+
+mission_service = MissionService(
+    bot=bot,
+    db_manager=db_manager,
+    identity_service=identity_service,
+    maintenance_service=maintenance_service,
+    clan_id=CLAN_ID,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    skip_image_path=SKIP_IMAGE_PATH,
+    logger=logger,
+    schedule_admin_notification=schedule_admin_notification,
+)
+
+configure_middlewares(dp)
+register_user_flow_handlers(
+    dp,
+    bot=bot,
+    logger=logger,
+    mission_service=mission_service,
+    db_manager=db_manager,
+    identity_service=identity_service,
+    notification_service=notification_service,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    clan_id=CLAN_ID,
+    skip_image_path=SKIP_IMAGE_PATH,
+    admin_ids=ADMIN_IDS,
+    authorized_groups=AUTHORIZED_GROUPS,
+    schedule_admin_notification=schedule_admin_notification,
+)
+mission_service.register_handlers(dp)
+dp.message.register(manual_cleanup, Command("cleanup"))
+
+
+async def main() -> None:
+    maybe_log_public_ip()
+    setup_scheduler(
+        scheduler,
+        maintenance_service=maintenance_service,
+        mission_service=mission_service,
+        identity_service=identity_service,
+        profile_auto_sync_minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
+        logger=logger,
     )
+    await maintenance_service.prepopulate_users()
+    await identity_service.refresh_linked_profiles()
 
-    await db_manager.mark_active_mission_processed(mission_id, tier_start_time)
-    logger.info(
-        "Missione %s processata e registrata (event_id=%s).",
-        mission_id,
-        event_id or "N/A",
-    )
-
-
-# =============================================================================
-# FUNZIONI HELPER PER FSM E GESTIONE MESSAGGI DI MODIFICA
-# =============================================================================
-async def add_modify_msg(state: FSMContext, msg: Message):
-    """
-    Aggiunge l'ID del messaggio inviato allo state per eventuale cancellazione successiva.
-    """
-    data = await state.get_data()
-    msg_ids = data.get("modify_msg_ids", [])
-    msg_ids.append(msg.message_id)
-    await state.update_data(modify_msg_ids=msg_ids)
-
-# =============================================================================
-# DEFINIZIONE DEGLI STATE PER LA MODIFICA E PER IL PROFILO GIOCATORE
-# =============================================================================
-class ModifyStates(StatesGroup):
-    CHOOSING_PLAYER = State()
-    CHOOSING_CURRENCY = State()
-    ENTERING_AMOUNT = State()
-
-class PlayerStates(StatesGroup):
-    MEMBER_CHECK = State()
-    PROFILE_SEARCH = State()
-
-
-class LinkStates(StatesGroup):
-    WAITING_GAME_USERNAME = State()
-    WAITING_VERIFICATION = State()
-
-# =============================================================================
-# DEFINIZIONE DELLE CALLBACK DATA (per il flusso menu, modifica e missione)
-# =============================================================================
-class ModifyCallback(CallbackData, prefix="modify"):
-    action: str
-    value: str = ""
-
-class MenuCallback(CallbackData, prefix="menu"):
-    action: str
-
-class MissionCallback(CallbackData, prefix="mission"):
-    action: str
-
-# =============================================================================
-# FUNZIONI DI PAGINAZIONE DEI GIOCATORI
-# NOTA: Le seguenti funzioni "create_players_keyboard" e "make_page_text" sono
-# duplicate nel file. Qui ne trovi una versione; più avanti nel file viene
-# ripetuta (non rimuovere la duplicazione come richiesto).
-# =============================================================================
-def is_admin(user_id: int) -> bool:
-    """
-    Verifica se l'utente è un admin autorizzato.
-    """
-    return user_id in ADMIN_IDS
-
-async def check_admin_access(callback: types.CallbackQuery) -> bool:
-    """
-    Controlla se l'utente ha accesso admin e invia messaggio di errore se necessario.
-    """
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Non hai le autorizzazioni per questa operazione", show_alert=True)
-        return False
-    return True
-
-def create_players_keyboard(players: List[str], page: int, page_size: int = 10) -> InlineKeyboardMarkup:
-    """
-    Crea una tastiera inline per la selezione dei giocatori, con paginazione.
-    """
-    start_index = page * page_size
-    end_index = start_index + page_size
-    page_players = players[start_index:end_index]
-    kb_buttons = [[InlineKeyboardButton(text=username, callback_data=f"modify_player_{username}")]
-                  for username in page_players]
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️ Indietro", callback_data=f"modify_paginate_{page-1}"))
-    if end_index < len(players):
-        nav_buttons.append(InlineKeyboardButton(text="➡️ Avanti", callback_data=f"modify_paginate_{page+1}"))
-    if nav_buttons:
-        kb_buttons.append(nav_buttons)
-    kb_buttons.append([InlineKeyboardButton(text="Fine", callback_data="modify_finish")])
-    return InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-
-def make_page_text(page: int, players: List[str], page_size: int = 10) -> str:
-    """
-    Ritorna il testo della pagina corrente con l'elenco dei giocatori.
-    """
-    total_pages = (len(players) - 1) // page_size + 1
-    start_index = page * page_size
-    end_index = min(start_index + page_size, len(players))
-    page_players = players[start_index:end_index]
-    text = f"Pagina {page+1}/{total_pages}:\n" + "\n".join(page_players)
-    return text
-
-# =============================================================================
-# ALTRE FUNZIONI UTILI
-# =============================================================================
-def escape_markdown_v2(text: str) -> str:
-    """
-    Funzione mantenuta per compatibilità (anche se con parse_mode="HTML" non viene più usata).
-    """
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    return ''.join(f'\\{c}' if c in special_chars else c for c in text)
-
-def format_player_info(player_info):
-    """
-    Formattta le informazioni del giocatore in HTML.
-    """
-    def format_field(value, hidden_text="Nascosto"):
-        return hidden_text if value in (-1, None, "N/A") else str(value)
-
-    last_online = player_info.get('lastOnline', 'N/A')
-    formatted_last_online = last_online.split("T")[0] if "T" in last_online else last_online
-
-    creation_time = player_info.get('creationTime', 'N/A')
-    formatted_creation_time = creation_time.split("T")[0] if "T" in creation_time else creation_time
-
-    clan_id = player_info.get('clanId', 'N/A')
-    formatted_clan_id = "Nessuno" if clan_id == "N/A" else clan_id
-
-    game_stats = player_info.get('gameStats', {})
-
-    text_info = (
-        f"<b>Informazioni per il giocatore</b> <i>{player_info.get('username', 'N/A')}</i>:\n\n"
-        f"<b>ID:</b> {player_info.get('id', 'N/A')}\n"
-        f"<b>Messaggio Personale:</b>\n{player_info.get('personalMessage', 'N/A')}\n\n"
-        f"<b>Livello:</b> {format_field(player_info.get('level', 'N/A'))}\n"
-        f"<b>Stato:</b> {player_info.get('status', 'N/A')}\n"
-        f"<b>Ultimo Accesso:</b> {formatted_last_online}\n\n"
-        f"<b>Roses:</b>\n"
-        f" • Ricevute: {format_field(player_info.get('receivedRosesCount'))}\n"
-        f" • Inviate: {format_field(player_info.get('sentRosesCount'))}\n\n"
-        f"<b>ID Clan:</b> {formatted_clan_id}\n"
-        f"<b>Tempo di Creazione:</b> {formatted_creation_time}\n\n"
-        f"<b>Statistiche di Gioco:</b>\n"
-        f" • Vittorie Totali: {format_field(game_stats.get('totalWinCount'))}\n"
-        f" • Sconfitte Totali: {format_field(game_stats.get('totalLoseCount'))}\n"
-        f" • Pareggi Totali: {format_field(game_stats.get('totalTieCount'))}\n"
-        f" • Tempo Totale di Gioco (minuti): {format_field(game_stats.get('totalPlayTimeInMinutes'))}\n"
-    )
-    return text_info
-
-async def get_best_resolution_url(url_base: str) -> str:
-    """
-    Tenta di ottenere la versione in alta risoluzione di un'immagine (@3x, @2x) se disponibile.
-    """
-    if not isinstance(url_base, str):
-        return ""
-    if not url_base.endswith(".png"):
-        return url_base
-
-    # Prova @3x
-    url_3x = url_base.replace(".png", "@3x.png")
-    async with aiohttp.ClientSession() as session:
-        async with session.head(url_3x) as resp:
-            if resp.status == 200:
-                return url_3x
-
-    # Prova @2x
-    url_2x = url_base.replace(".png", "@2x.png")
-    async with aiohttp.ClientSession() as session:
-        async with session.head(url_2x) as resp:
-            if resp.status == 200:
-                return url_2x
-
-    return url_base
-
-
-def generate_verification_code() -> str:
-    """Genera un codice casuale utilizzato per la verifica dell'identità."""
-
-    return secrets.token_hex(3).upper()
-
-
-def build_verification_keyboard() -> InlineKeyboardMarkup:
-    """Crea la tastiera inline condivisa per la verifica del profilo."""
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Ho aggiornato il profilo",
-                    callback_data="link_verify",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Annulla",
-                    callback_data="link_cancel",
-                )
-            ],
-        ]
-    )
-
-
-async def fetch_player_by_username(username: str) -> Optional[Dict[str, Any]]:
-    """Recupera le informazioni del giocatore tramite username."""
-
-    if not username:
-        return None
-    query = quote_plus(username.strip())
-    url = f"https://api.wolvesville.com/players/search?username={query}"
-    headers = {
-        "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-        "Accept": "application/json",
-    }
     try:
+        await notification_service.send_bot_status_update(
+            "AVVIATO",
+            "Bot inizializzato correttamente con sistemi di sicurezza attivi."
+            f" Gruppi autorizzati: {len(AUTHORIZED_GROUPS)}",
+        )
+    except Exception as exc:  # pragma: no cover - solo log
+        if bot_logger is not None:
+            bot_logger.log_error(exc, "Errore invio notifica avvio bot")
+        else:
+            logger.error("Errore invio notifica avvio bot: %s", exc)
+
+    logger.info("Avvio del bot.")
+    await dp.start_polling(bot)
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
