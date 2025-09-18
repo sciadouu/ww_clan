@@ -17,23 +17,24 @@ from urllib.parse import quote_plus
 import requests
 import aiohttp
 from PIL import Image
-import motor.motor_asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Import di Aiogram
-from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram import types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, FSInputFile, Message, ChatMemberUpdated
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import Command, ChatMemberUpdatedFilter, KICKED, MEMBER, ADMINISTRATOR
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound
+from services.identity_service import (
+    IdentityService,
+    format_markdown_code,
+    format_telegram_username,
+)
+from services.maintenance_service import MaintenanceService
 from services.notification_service import EnhancedNotificationService, NotificationType
-from services.db_manager import MongoManager
+from bot_app import create_app_context
 from config import (
     TOKEN,
     WOLVESVILLE_API_KEY,
@@ -98,29 +99,6 @@ def maybe_log_public_ip() -> None:
         logger.info("IP pubblico del bot: %s", public_ip)
 
 
-def format_telegram_username(username: Optional[str]) -> str:
-    """Restituisce uno username Telegram formattato con @ oppure un segnaposto."""
-
-    if not username:
-        return "—"
-    cleaned = username.strip()
-    if not cleaned:
-        return "—"
-    return cleaned if cleaned.startswith("@") else f"@{cleaned}"
-
-
-def format_markdown_code(value: Optional[Any]) -> str:
-    """Formatta un valore come blocco inline oppure restituisce un segnaposto."""
-
-    if value is None:
-        return "—"
-    text = str(value).strip()
-    if not text or text == "—":
-        return "—"
-    safe = text.replace("`", "\\`")
-    return f"`{safe}`"
-
-
 def schedule_admin_notification(
     message: str,
     *,
@@ -148,197 +126,6 @@ def schedule_admin_notification(
         logger.warning(
             "Loop asyncio non attivo: impossibile pianificare la notifica admin immediatamente."
         )
-
-
-def build_profile_snapshot(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Estrae un sottoinsieme sicuro dei dati del profilo per i log."""
-
-    if not profile:
-        return None
-
-    snapshot: Dict[str, Any] = {
-        "telegram_id": profile.get("telegram_id"),
-        "telegram_username": profile.get("telegram_username"),
-        "game_username": profile.get("game_username"),
-        "wolvesville_id": profile.get("wolvesville_id"),
-    }
-
-    if profile.get("updated_at"):
-        snapshot["updated_at"] = profile.get("updated_at")
-    if profile.get("created_at"):
-        snapshot["created_at"] = profile.get("created_at")
-
-    verification = profile.get("verification")
-    if isinstance(verification, dict):
-        snapshot["verification"] = {
-            key: verification.get(key)
-            for key in ("status", "verified_at", "method", "code")
-            if verification.get(key) is not None
-        }
-
-    return snapshot
-
-
-def handle_telegram_sync_result(
-    result: Optional[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    """Invia notifiche se cambia lo username Telegram e restituisce il profilo aggiornato."""
-
-    if not result:
-        return None
-
-    profile = result.get("profile")
-    if profile is None:
-        return None
-
-    if result.get("telegram_username_changed"):
-        game_username = profile.get("game_username")
-        if game_username:
-            old_username = format_telegram_username(
-                result.get("previous_telegram_username")
-            )
-            new_username = format_telegram_username(profile.get("telegram_username"))
-            message = (
-                "♻️ **Aggiornamento username Telegram**\n\n"
-                f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
-                f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-                f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
-            )
-            schedule_admin_notification(
-                message,
-                notification_type=NotificationType.INFO,
-            )
-
-    return profile
-
-
-def handle_profile_link_result(
-    result: Optional[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    """Analizza il risultato del linking e notifica variazioni allo username di gioco."""
-
-    if not result or result.get("conflict"):
-        return result.get("profile") if result else None
-
-    profile = result.get("profile")
-    if profile is None:
-        return None
-
-    if result.get("game_username_changed") and result.get("previous_game_username"):
-        telegram_display = format_telegram_username(profile.get("telegram_username"))
-        message = (
-            "♻️ **Aggiornamento username Wolvesville**\n\n"
-            f"💬 **Telegram:** {format_markdown_code(telegram_display)}\n"
-            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-            f"🆔 **Wolvesville ID:** {format_markdown_code(profile.get('wolvesville_id'))}\n"
-            f"🔁 **Username:** {format_markdown_code(result.get('previous_game_username'))} → {format_markdown_code(profile.get('game_username'))}"
-        )
-        schedule_admin_notification(
-            message,
-            notification_type=NotificationType.INFO,
-        )
-
-    return profile
-
-
-async def resolve_member_identity(username: Optional[str]) -> Dict[str, Any]:
-    """Risolvi uno username di gioco in base al profilo collegato."""
-
-    raw_username = username or ""
-    cleaned_username = raw_username.strip()
-
-    identity: Dict[str, Any] = {
-        "input_username": username,
-        "original_username": cleaned_username or None,
-        "resolved_username": cleaned_username or None,
-        "telegram_id": None,
-        "telegram_username": None,
-        "match": None,
-        "profile": None,
-        "profile_snapshot": None,
-    }
-
-    if not cleaned_username:
-        return identity
-
-    try:
-        resolution = await db_manager.resolve_profile_by_game_alias(cleaned_username)
-    except Exception as exc:  # pragma: no cover - log diagnostico
-        logger.warning(
-            "Impossibile risolvere il profilo per %s: %s",
-            cleaned_username,
-            exc,
-        )
-        return identity
-
-    if not resolution:
-        return identity
-
-    profile = resolution.get("profile") or {}
-    resolved_username = resolution.get("resolved_username") or cleaned_username
-
-    identity.update(
-        {
-            "resolved_username": resolved_username,
-            "match": resolution.get("match"),
-            "telegram_id": profile.get("telegram_id"),
-            "telegram_username": profile.get("telegram_username"),
-            "profile": profile,
-            "profile_snapshot": build_profile_snapshot(profile),
-        }
-    )
-
-    return identity
-
-
-async def ensure_telegram_profile_synced(user: Optional[types.User]) -> None:
-    """Allinea il profilo Telegram con il database e notifica eventuali cambi username."""
-
-    if user is None:
-        return
-
-    full_name_parts = [user.first_name or "", user.last_name or ""]
-    full_name = " ".join(part for part in full_name_parts if part).strip() or None
-
-    try:
-        result = await db_manager.sync_telegram_metadata(
-            user.id,
-            telegram_username=user.username,
-            full_name=full_name,
-        )
-    except Exception as exc:  # pragma: no cover - logging di sicurezza
-        logger.warning(
-            "Impossibile aggiornare il profilo Telegram per %s: %s",
-            getattr(user, "id", "?"),
-            exc,
-        )
-        return
-
-    if not result or result.get("created"):
-        return
-
-    handle_telegram_sync_result(result)
-    if (
-        result.get("telegram_username_changed")
-        and result.get("profile")
-    ):
-        profile = result["profile"]
-        game_username = profile.get("game_username")
-        if not game_username:
-            return
-        old_username = format_telegram_username(result.get("previous_telegram_username"))
-        new_username = format_telegram_username(profile.get("telegram_username"))
-        message = (
-            "♻️ **Aggiornamento username Telegram**\n\n"
-            f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
-            f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-            f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
-        )
-        schedule_admin_notification(
-            message,
-            notification_type=NotificationType.INFO,
-        )
-
 # =============================================================================
 # CONFIGURAZIONE DI MONGODB
 # =============================================================================
@@ -346,8 +133,39 @@ MONGO_URI = "mongodb+srv://Admin:X3TaVDKSSQDcfUG@wolvesville.6mrnmcn.mongodb.net
 DATABASE_NAME = "Wolvesville"
 USERS_COLLECTION = "users"
 
-mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, tlsAllowInvalidCertificates=True)
-db_manager = MongoManager(mongo_client, DATABASE_NAME)
+app_context = create_app_context(
+    token=TOKEN,
+    mongo_uri=MONGO_URI,
+    database_name=DATABASE_NAME,
+    admin_ids=ADMIN_IDS,
+    admin_channel_id=ADMIN_NOTIFICATION_CHANNEL,
+    owner_id=OWNER_CHAT_ID,
+)
+
+bot = app_context.bot
+dp = app_context.dispatcher
+notification_service = app_context.notification_service
+db_manager = app_context.db_manager
+scheduler = app_context.scheduler
+mongo_client = app_context.mongo_client
+
+identity_service = IdentityService(
+    bot=bot,
+    db_manager=db_manager,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    schedule_admin_notification=schedule_admin_notification,
+    logger=logger,
+)
+
+maintenance_service = MaintenanceService(
+    bot=bot,
+    db_manager=db_manager,
+    identity_service=identity_service,
+    clan_id=CLAN_ID,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    admin_ids=ADMIN_IDS,
+    logger=logger,
+)
 
 # Tempo di reset per considerare solo le donazioni future
 RESET_TIME = datetime.now(timezone.utc)
@@ -364,7 +182,7 @@ class LoggingMiddleware(BaseMiddleware):
             text = event.text if event.text else "<Non testuale>"
             logger.info(f"Messaggio ricevuto | Chat ID: {chat_id} | Thread ID: {thread_id} | Utente ID: {user_id} | Testo: {text}")
             try:
-                await ensure_telegram_profile_synced(event.from_user)
+                await identity_service.ensure_telegram_profile_synced(event.from_user)
             except Exception as exc:  # pragma: no cover - evitare crash middleware
                 logger.warning("Sync profilo Telegram fallita per %s: %s", user_id, exc)
         return await handler(event, data)
@@ -377,350 +195,6 @@ class UpdateLoggingMiddleware(BaseMiddleware):
 # =============================================================================
 # FUNZIONI DI ACCESSO AL DATABASE
 # =============================================================================
-# Aggiungi questa funzione dopo le altre funzioni di database
-
-# Aggiungi questa funzione dopo le altre funzioni di database
-async def clean_duplicate_users():
-    """
-    Rimuove utenti duplicati dal database mantenendo solo uno per username.
-    """
-    try:
-        removed_info = await db_manager.remove_duplicate_users()
-        total_removed = sum(item.get("removed", 0) for item in removed_info)
-
-        for item in removed_info:
-            username = item.get("username", "sconosciuto")
-            removed = item.get("removed", 0)
-            removed_ids = item.get("removed_ids", [])
-            logger.info(
-                "Eliminati %s duplicati per %s (documenti rimossi: %s)",
-                removed,
-                username,
-                removed_ids,
-            )
-
-        logger.info(
-            "Pulizia duplicati completata. Eliminati %s duplicati.",
-            total_removed,
-        )
-
-    except Exception as e:
-        logger.error(f"Errore durante pulizia duplicati: {e}")
-
-async def check_clan_departures():
-    """
-    Controlla se qualche utente è uscito dal clan e gestisce debiti/pulizia.
-    VERSIONE MIGLIORATA con più controlli di sicurezza.
-    """
-    try:
-        # Ottieni membri attuali del clan
-        url = f"https://api.wolvesville.com/clans/{CLAN_ID}/members"
-        headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status != 200:
-                    logger.error(f"Errore nel recupero membri clan: {response.status}")
-                    return
-                current_members = await response.json()
-
-        # Estrai usernames attuali (con validazione)
-        current_usernames = set()
-        for member in current_members:
-            username = member.get("username")
-            if username and isinstance(username, str) and len(username) > 0:
-                current_usernames.add(username)
-
-        # Ottieni tutti gli utenti nel database
-        db_users = await db_manager.list_users()
-
-        users_removed = 0
-        debt_notifications = 0
-
-        # Controlla chi è uscito dal clan
-        for user in db_users:
-            username = user.get("username")
-            if not username or username in current_usernames:
-                continue  # Utente ancora nel clan o username non valido
-
-            donazioni = user.get("donazioni", {})
-            oro = donazioni.get("Oro", 0)
-            gem = donazioni.get("Gem", 0)
-
-            # Assicurati che oro e gem siano numeri
-            try:
-                oro = int(oro) if oro is not None else 0
-                gem = int(gem) if gem is not None else 0
-            except (ValueError, TypeError):
-                oro = gem = 0
-
-            # Se ha debiti (valori negativi)
-            if oro < 0 or gem < 0:
-                # Invia notifica admin
-                debt_message = (
-                    f"🚨 <b>USCITA CON DEBITI</b> 🚨\n\n"
-                    f"👤 <b>Utente:</b> {username}\n"
-                    f"💰 <b>Debito Oro:</b> {abs(oro) if oro < 0 else 0:,}\n"
-                    f"💎 <b>Debito Gem:</b> {abs(gem) if gem < 0 else 0:,}\n\n"
-                    f"⚠️ L'utente ha abbandonato il clan con debiti non saldati!\n"
-                    f"📅 Data controllo: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-                )
-
-                # Invia a tutti gli admin
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin_id, debt_message, parse_mode="HTML")
-                        debt_notifications += 1
-                    except Exception as e:
-                        logger.warning(f"Impossibile inviare notifica debito ad admin {admin_id}: {e}")
-
-                logger.info(f"Notificato debito per utente uscito: {username} (Oro: {oro}, Gem: {gem})")
-
-            else:
-                # Nessun debito, elimina dal database
-                removed = await db_manager.remove_user_by_username(username)
-                if removed > 0:
-                    users_removed += 1
-                    logger.info(f"Utente {username} rimosso dal database (nessun debito)")
-
-        # Log riassuntivo
-        logger.info(f"Controllo uscite clan completato: {users_removed} utenti rimossi, {debt_notifications} notifiche debiti inviate")
-
-    except Exception as e:
-        logger.error(f"Errore durante controllo uscite clan: {e}")
-
-
-# MODIFICA la funzione prepopulate_users per evitare duplicati futuri
-async def prepopulate_users():
-    """
-    Pre-popolazione degli utenti: per ogni membro recuperato dall'API del clan,
-    crea un record (se non esistente) con bilancio iniziale a 0.
-    EVITA DUPLICATI usando username come chiave unica.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/members"
-    headers = {"Authorization": f"Bot {WOLVESVILLE_API_KEY}", "Accept": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                logger.error(f"Errore nel recupero dei membri: {response.status}")
-                return
-            members = await response.json()
-
-            for member in members:
-                username = member.get("username")
-                if username:
-                    # UPSERT con controllo duplicati migliorato
-                    inserted = await db_manager.ensure_user(username)
-                    if inserted:
-                        logger.info(f"Utente {username} pre-popolato con bilancio 0.")
-
-
-async def refresh_linked_profiles() -> None:
-    """Sincronizza periodicamente gli username Telegram e Wolvesville già collegati."""
-
-    try:
-        profiles = await db_manager.list_linked_player_profiles()
-    except Exception as exc:
-        logger.warning("Impossibile recuperare i profili collegati: %s", exc)
-        return
-
-    if not profiles:
-        return
-
-    async with aiohttp.ClientSession() as wolvesville_session:
-        for profile in profiles:
-            telegram_id = profile.get("telegram_id")
-            if not telegram_id:
-                continue
-
-            latest_profile = profile
-
-            try:
-                chat = await bot.get_chat(telegram_id)
-            except TelegramForbiddenError:
-                logger.debug(
-                    "Sync Telegram ignorato per %s: bot bloccato", telegram_id
-                )
-            except TelegramNotFound:
-                logger.debug(
-                    "Sync Telegram ignorato per %s: utente non trovato", telegram_id
-                )
-            except TelegramBadRequest as exc:
-                logger.debug(
-                    "Sync Telegram fallito per %s: %s", telegram_id, exc
-                )
-            else:
-                chat_full_name = (
-                    " ".join(
-                        part
-                        for part in [chat.first_name, chat.last_name]
-                        if part
-                    ).strip()
-                    or None
-                )
-                try:
-                    result = await db_manager.sync_telegram_metadata(
-                        telegram_id,
-                        telegram_username=chat.username,
-                        full_name=chat_full_name,
-                    )
-                except Exception as exc:  # pragma: no cover - diagnosi schedulatore
-                    logger.warning(
-                        "Sync Telegram fallito per %s: %s", telegram_id, exc
-                    )
-                else:
-                    updated_profile = handle_telegram_sync_result(result)
-                    if updated_profile:
-                        latest_profile = updated_profile
-
-            wolvesville_id = (
-                latest_profile.get("wolvesville_id")
-                if isinstance(latest_profile, dict)
-                else profile.get("wolvesville_id")
-            )
-            if not wolvesville_id:
-                continue
-
-            player_info = await fetch_player_by_id(
-                wolvesville_id,
-                session=wolvesville_session,
-            )
-            if not player_info:
-                continue
-
-            new_username = player_info.get("username")
-            if not new_username:
-                continue
-
-            try:
-                link_result = await db_manager.link_player_profile(
-                    telegram_id,
-                    game_username=new_username,
-                    telegram_username=latest_profile.get("telegram_username")
-                    if isinstance(latest_profile, dict)
-                    else profile.get("telegram_username"),
-                    full_name=latest_profile.get("full_name")
-                    if isinstance(latest_profile, dict)
-                    else profile.get("full_name"),
-                    wolvesville_id=wolvesville_id,
-                    verified=False,
-                    verification_code=None,
-                    verification_method=None,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Aggiornamento profilo Wolvesville fallito per %s: %s",
-                    telegram_id,
-                    exc,
-                )
-                continue
-
-            if link_result and link_result.get("conflict"):
-                logger.warning(
-                    "Conflitto durante l'aggiornamento del profilo per %s: %s",
-                    telegram_id,
-                    link_result.get("reason"),
-                )
-                continue
-
-            updated_profile = handle_profile_link_result(link_result)
-            if updated_profile:
-                latest_profile = updated_profile
-
-            await asyncio.sleep(0.1)
-
-
-async def update_user_balance(username: str, currency: str, amount: int):
-    """
-    Aggiorna il bilancio di un utente per una determinata valuta.
-    Se 'currency' è "gold" (o qualunque forma simile) viene usato il campo "Oro",
-    mentre se è "gem" viene usato "Gem". In questo modo si evita di creare campi
-    duplicati (es. "Gold") e si mantiene il DB con soli due campi: Oro e Gem.
-    """
-    normalized_currency = await db_manager.update_user_balance(username, currency, amount)
-    logger.info(f"Aggiornato bilancio per {username}: {normalized_currency} += {amount}")
-
-
-async def process_ledger():
-    """
-    Recupera il ledger dal clan e aggiorna il DB solo con i record di tipo "DONATE" non ancora processati.
-    """
-    url = f"https://api.wolvesville.com/clans/{CLAN_ID}/ledger"
-    headers = {
-        "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-        "Accept": "application/json"
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                logger.error(f"Errore nel recupero del ledger: {response.status}")
-                return
-            ledger_data = await response.json()
-
-            for record in ledger_data:
-                record_id = record.get("id")
-                record_type = record.get("type", "")
-                # Vogliamo processare solo i record di tipo "DONATE"
-                if record_type != "DONATE":
-                    continue
-
-                # Verifica se abbiamo già processato questo record
-                if await db_manager.has_processed_ledger(record_id):
-                    # Significa che l'abbiamo già gestito, quindi skip
-                    continue
-
-                # Non ancora processato => aggiorna il bilancio
-                username = record.get("playerUsername")
-                gold_amount = record.get("gold", 0) or 0
-                gems_amount = record.get("gems", 0) or 0
-
-                # Se c'è un username e c'è effettivamente una donazione > 0
-                if username and (gold_amount > 0 or gems_amount > 0):
-                    identity = await resolve_member_identity(username)
-                    resolved_username = identity.get("resolved_username")
-                    if not resolved_username:
-                        logger.warning(
-                            "Record ledger %s ignorato: username non valido (%s)",
-                            record_id,
-                            username,
-                        )
-                        continue
-
-                    original_username = identity.get("original_username") or username
-                    if (
-                        identity.get("match") == "history"
-                        and original_username
-                        and original_username != resolved_username
-                    ):
-                        logger.info(
-                            "Ledger: risolto alias %s → %s (record %s)",
-                            original_username,
-                            resolved_username,
-                            record_id,
-                        )
-
-                    # Aggiungi gold a Oro
-                    if gold_amount > 0:
-                        await update_user_balance(resolved_username, "Oro", gold_amount)
-                    # Aggiungi gems
-                    if gems_amount > 0:
-                        await update_user_balance(resolved_username, "Gem", gems_amount)
-
-                    await db_manager.log_donation(
-                        record_id,
-                        resolved_username,
-                        gold_amount,
-                        gems_amount,
-                        raw_record=record,
-                        telegram_id=identity.get("telegram_id"),
-                        telegram_username=identity.get("telegram_username"),
-                        profile_snapshot=identity.get("profile_snapshot"),
-                        original_username=original_username,
-                        match_source=identity.get("match"),
-                    )
-
-                # Segna questo record come "già processato"
-                await db_manager.mark_ledger_processed(record_id, raw_record=record)
 
 async def process_mission(
     participants: List[str],
@@ -745,7 +219,7 @@ async def process_mission(
     unresolved_participants: List[str] = []
 
     for participant in participants:
-        identity = await resolve_member_identity(participant)
+        identity = await identity_service.resolve_member_identity(participant)
         resolved_username = identity.get("resolved_username")
         if not resolved_username:
             logger.warning(
@@ -797,7 +271,9 @@ async def process_mission(
 
     if cost != 0:
         for identity in resolved_identities:
-            await update_user_balance(identity["resolved_username"], currency_key, -cost)
+            await maintenance_service.update_user_balance(
+                identity["resolved_username"], currency_key, -cost
+            )
         logger.info(
             "Applicato costo di %s %s a %s partecipanti (missione %s).",
             cost,
@@ -911,7 +387,7 @@ async def process_active_mission_auto():
     alias_resolved_count = 0
     unresolved_usernames: List[str] = []
     for username in raw_usernames:
-        identity = await resolve_member_identity(username)
+        identity = await identity_service.resolve_member_identity(username)
         resolved_username = identity.get("resolved_username")
         if not resolved_username:
             logger.warning(
@@ -954,7 +430,9 @@ async def process_active_mission_auto():
 
     if cost:
         for identity in resolved_identities:
-            await update_user_balance(identity["resolved_username"], mission_type, -cost)
+            await maintenance_service.update_user_balance(
+                identity["resolved_username"], mission_type, -cost
+            )
             log_name = identity.get("resolved_username")
             original = identity.get("original_username")
             if original and original != log_name:
@@ -1256,42 +734,6 @@ async def fetch_player_by_username(username: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
-async def fetch_player_by_id(
-    player_id: str,
-    *,
-    session: Optional[aiohttp.ClientSession] = None,
-) -> Optional[Dict[str, Any]]:
-    """Recupera un giocatore tramite ID Wolvesville."""
-
-    if not player_id:
-        return None
-
-    url = f"https://api.wolvesville.com/players/{player_id}"
-    headers = {
-        "Authorization": f"Bot {WOLVESVILLE_API_KEY}",
-        "Accept": "application/json",
-    }
-
-    async def _do_request(client: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        async with client.get(url, headers=headers) as response:
-            if response.status != 200:
-                logger.warning(
-                    "Impossibile recuperare il giocatore con ID %s (status %s)",
-                    player_id,
-                    response.status,
-                )
-                return None
-            return await response.json()
-
-    try:
-        if session is not None:
-            return await _do_request(session)
-        async with aiohttp.ClientSession() as owned_session:
-            return await _do_request(owned_session)
-    except Exception as exc:
-        logger.error("Errore durante il recupero del giocatore %s: %s", player_id, exc)
-        return None
-
 def chunk_list(items, chunk_size=6):
     """
     Divide una lista in "chunk" (sotto-liste) della dimensione specificata.
@@ -1340,37 +782,22 @@ def add_clan_to_file(clan_id: str, clan_name: str):
 # =============================================================================
 # CONFIGURAZIONE DEL BOT E DEL DISPATCHER
 # =============================================================================
-bot = Bot(
-    token=TOKEN,
-    session=AiohttpSession(),
-    default=DefaultBotProperties(parse_mode="HTML")
+if bot_logger is not None:
+    bot_logger.add_telegram_handler(bot, ADMIN_IDS)
 
-)
-dp = Dispatcher(storage=MemoryStorage())
-
-# Inizializzazione servizio notifiche
-# Initialize notification service
-notification_service = EnhancedNotificationService(
-    bot=bot,
-    admin_ids=ADMIN_IDS,
-    admin_channel_id=ADMIN_NOTIFICATION_CHANNEL,
-    owner_id=OWNER_CHAT_ID
-)
-
-# Setup logging con handler Telegram
-bot_logger.add_telegram_handler(bot, ADMIN_IDS)
-
-# Inizializzazione middleware autorizzazione
-auth_middleware = GroupAuthorizationMiddleware(
-    authorized_groups=set(AUTHORIZED_GROUPS),
-    admin_ids=ADMIN_IDS,
-    notification_service=notification_service
-)
+auth_middleware = None
+if MIDDLEWARE_AVAILABLE:
+    auth_middleware = GroupAuthorizationMiddleware(
+        authorized_groups=set(AUTHORIZED_GROUPS),
+        admin_ids=ADMIN_IDS,
+        notification_service=notification_service,
+    )
 
 # Registrazione middleware nell'ordine corretto
 # IMPORTANTE: Aggiungi PRIMA dei middleware esistenti
 dp.update.middleware(LoggingMiddleware())    # Prima il logging
-dp.update.middleware(auth_middleware)        # Poi l'autorizzazione
+if auth_middleware is not None:
+    dp.update.middleware(auth_middleware)        # Poi l'autorizzazione
 
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
 async def bot_kicked_from_chat(event: ChatMemberUpdated):
@@ -1486,11 +913,8 @@ ADMIN_IDS = [7020291568]
 # =============================================================================
 # CONFIGURAZIONE DELLO SCHEDULER
 # =============================================================================
-def setup_scheduler():
-    """
-    Configura lo scheduler per eseguire periodicamente alcune funzioni.
-    """
-    scheduler = AsyncIOScheduler(timezone="Europe/Rome")
+def setup_scheduler(scheduler: AsyncIOScheduler) -> AsyncIOScheduler:
+    """Configura lo scheduler condiviso e avvia i job di manutenzione."""
 
     # CORREZIONE: Invio skin/messaggi lunedì alle 8:00 (non 11:00)
     scheduler.add_job(
@@ -1501,27 +925,49 @@ def setup_scheduler():
         minute=0,
         timezone="Europe/Rome"
     )
-    scheduler.add_job(process_ledger, "interval", minutes=5, next_run_time=datetime.now())
-    scheduler.add_job(process_active_mission_auto, "interval", minutes=5, next_run_time=datetime.now())
-    scheduler.add_job(prepopulate_users, "interval", days=3, next_run_time=datetime.now())
     scheduler.add_job(
-        refresh_linked_profiles,
+        maintenance_service.process_ledger,
+        "interval",
+        minutes=5,
+        next_run_time=datetime.now(),
+    )
+    scheduler.add_job(process_active_mission_auto, "interval", minutes=5, next_run_time=datetime.now())
+    scheduler.add_job(
+        maintenance_service.prepopulate_users,
+        "interval",
+        days=3,
+        next_run_time=datetime.now(),
+    )
+    scheduler.add_job(
+        identity_service.refresh_linked_profiles,
         "interval",
         minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
         next_run_time=datetime.now(),
     )
 
     # NUOVE funzioni per pulizia e controllo
-    scheduler.add_job(clean_duplicate_users, "interval", hours=24, next_run_time=datetime.now())  # Ogni giorno
-    scheduler.add_job(check_clan_departures, "interval", hours=6, next_run_time=datetime.now())   # Ogni 6 ore
+    scheduler.add_job(
+        maintenance_service.clean_duplicate_users,
+        "interval",
+        hours=24,
+        next_run_time=datetime.now(),
+    )  # Ogni giorno
+    scheduler.add_job(
+        maintenance_service.check_clan_departures,
+        "interval",
+        hours=6,
+        next_run_time=datetime.now(),
+    )   # Ogni 6 ore
     # NUOVO: Controllo reminder calendario
     #scheduler.add_job(calendar_service.check_pending_reminders, "interval", minutes=1)
 
     # NUOVO: Pulizia log settimanale
     #scheduler.add_job(cleanup_old_logs, "cron", day_of_week="sun", hour=2, minute=0)
 
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.start()
     logger.info("Scheduler configurato con tutte le funzioni di manutenzione.")
+    return scheduler
 
 # =============================================================================
 # FUNZIONI VARIE DI SUPPORTO
@@ -1931,7 +1377,7 @@ async def finalize_profile_link(callback: types.CallbackQuery, state: FSMContext
         await state.clear()
         return
 
-    player_info = await fetch_player_by_id(player_id)
+    player_info = await identity_service.fetch_player_by_id(player_id)
     if not player_info:
         await callback.answer(
             "Non riesco a recuperare il profilo, riprova tra qualche secondo.",
@@ -2211,8 +1657,8 @@ async def manual_cleanup(message: types.Message):
     try:
         loading_msg = await message.answer("🔄 Avvio pulizia database...")
 
-        await clean_duplicate_users()
-        await check_clan_departures()
+        await maintenance_service.clean_duplicate_users()
+        await maintenance_service.check_clan_departures()
 
         await loading_msg.edit_text("✅ Pulizia completata!\n\n🗂️ Duplicati rimossi\n👥 Controllo uscite clan eseguito")
 
@@ -3283,9 +2729,9 @@ async def show_members_page(message: types.Message, state: FSMContext):
 # =============================================================================
 async def main():
     maybe_log_public_ip()
-    setup_scheduler()
-    await prepopulate_users()
-    await refresh_linked_profiles()
+    setup_scheduler(scheduler)
+    await maintenance_service.prepopulate_users()
+    await identity_service.refresh_linked_profiles()
 
     # NUOVO: Notifica avvio bot
     try:
