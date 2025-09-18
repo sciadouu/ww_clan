@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from services.db_manager import MongoManager
@@ -129,6 +130,20 @@ class RewardService:
             {"$sort": {"reward_points": -1}},
             {"$limit": limit}
         ]
-        
+
         leaderboard = await self.db.aggregate_users(pipeline)
         return leaderboard
+
+    async def get_top_contributors(
+        self,
+        *,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit: int = 10,
+        currency: Optional[str] = None,
+    ) -> List[Dict]:
+        """Espone i donatori principali per la logica premi."""
+
+        return await self.db.get_top_donors(
+            limit=limit, start=start, end=end, currency=currency
+        )

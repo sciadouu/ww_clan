@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 import aiohttp
@@ -105,6 +106,8 @@ class MissionService:
         participant_count = len(resolved_identities)
         unresolved_count = max(original_participant_count - participant_count, 0)
 
+        event_timestamp = datetime.now(timezone.utc)
+
         cost = 0
         currency_key = mission_type
 
@@ -181,6 +184,7 @@ class MissionService:
             cost_per_participant=cost,
             outcome=outcome,
             source=source,
+            occurred_at=event_timestamp,
             metadata=metadata_payload,
         )
 
@@ -282,6 +286,19 @@ class MissionService:
             else:
                 cost = 0
 
+        event_timestamp = None
+        for candidate in (
+            quest.get("lastCompletedAt"),
+            active_data.get("lastCompletedAt"),
+            quest.get("completedAt"),
+            tier_start_time,
+        ):
+            event_timestamp = self.maintenance_service._parse_record_timestamp(candidate)
+            if event_timestamp:
+                break
+        if event_timestamp is None:
+            event_timestamp = datetime.now(timezone.utc)
+
         if cost:
             for identity in resolved_identities:
                 await self.maintenance_service.update_user_balance(
@@ -352,10 +369,13 @@ class MissionService:
             cost_per_participant=cost,
             outcome="auto_processed",
             source="active_mission",
+            occurred_at=event_timestamp,
             metadata=metadata,
         )
 
-        await self.db_manager.mark_active_mission_processed(mission_id, tier_start_time)
+        await self.db_manager.mark_active_mission_processed(
+            mission_id, tier_start_time, processed_at=event_timestamp
+        )
         self.logger.info(
             "Missione %s processata e registrata (event_id=%s).",
             mission_id,

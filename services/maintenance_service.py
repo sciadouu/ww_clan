@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Sequence
 
 import aiohttp
@@ -254,6 +254,12 @@ class MaintenanceService:
             username = record.get("playerUsername")
             gold_amount = record.get("gold", 0) or 0
             gems_amount = record.get("gems", 0) or 0
+            occurred_at = self._parse_record_timestamp(
+                record.get("createdAt")
+                or record.get("created_at")
+                or record.get("timestamp")
+                or record.get("time")
+            )
 
             if username and (gold_amount > 0 or gems_amount > 0):
                 identity = await self._identity_service.resolve_member_identity(username)
@@ -297,6 +303,7 @@ class MaintenanceService:
                     gold_amount,
                     gems_amount,
                     raw_record=record,
+                    processed_at=occurred_at,
                     telegram_id=identity.get("telegram_id"),
                     telegram_username=identity.get("telegram_username"),
                     profile_snapshot=identity.get("profile_snapshot"),
@@ -304,5 +311,37 @@ class MaintenanceService:
                     match_source=identity.get("match"),
                 )
 
-            await self._db_manager.mark_ledger_processed(record_id, raw_record=record)
+            await self._db_manager.mark_ledger_processed(
+                record_id, raw_record=record, processed_at=occurred_at
+            )
+
+    @staticmethod
+    def _parse_record_timestamp(value) -> datetime | None:
+        """Prova a convertire valori eterogenei in datetime timezone-aware."""
+
+        if not value:
+            return None
+
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):  # pragma: no cover - input non atteso
+                return None
+
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return None
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+        return None
 
