@@ -14,6 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from services.db_manager import MongoManager
 from services.notification_service import EnhancedNotificationService
+from services.rewards_repository import RewardsRepository
 
 
 @dataclass(slots=True)
@@ -26,6 +27,7 @@ class BotAppContext:
     db_manager: MongoManager
     scheduler: AsyncIOScheduler
     mongo_client: motor.motor_asyncio.AsyncIOMotorClient
+    rewards_repository: RewardsRepository
 
 
 def _create_bot(token: str) -> Bot:
@@ -92,6 +94,7 @@ def create_app_context(
     bot = _create_bot(token)
     dispatcher = _create_dispatcher()
     mongo_client, db_manager = _create_mongo_manager(mongo_uri, database_name)
+    rewards_repository = RewardsRepository(db_manager=db_manager)
     notification_service = _create_notification_service(
         bot,
         admin_ids,
@@ -107,4 +110,5 @@ def create_app_context(
         db_manager=db_manager,
         scheduler=scheduler,
         mongo_client=mongo_client,
+        rewards_repository=rewards_repository,
     )
