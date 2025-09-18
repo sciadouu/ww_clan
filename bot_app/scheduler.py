@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from reward_service import RewardService
 from services.identity_service import IdentityService
 from services.maintenance_service import MaintenanceService
 from services.mission_service import MissionService
@@ -16,6 +17,7 @@ def setup_scheduler(
     maintenance_service: MaintenanceService,
     mission_service: MissionService,
     identity_service: IdentityService,
+    reward_service: RewardService,
     profile_auto_sync_minutes: int,
     logger,
 ) -> AsyncIOScheduler:
@@ -70,6 +72,24 @@ def setup_scheduler(
         "interval",
         hours=6,
         next_run_time=datetime.now(),
+    )
+
+    scheduler.add_job(
+        reward_service.publish_weekly_leaderboard,
+        "cron",
+        day_of_week="mon",
+        hour=9,
+        minute=0,
+        timezone="Europe/Rome",
+    )
+
+    scheduler.add_job(
+        reward_service.publish_monthly_leaderboard,
+        "cron",
+        day=1,
+        hour=9,
+        minute=5,
+        timezone="Europe/Rome",
     )
 
     if not scheduler.running:

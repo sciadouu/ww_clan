@@ -37,6 +37,7 @@ except ImportError as exc:  # pragma: no cover - il progetto può funzionare sen
     LoggingMiddleware = None  # type: ignore
     MIDDLEWARE_AVAILABLE = False
 
+from reward_service import RewardService
 from services.identity_service import IdentityService
 from services.maintenance_service import MaintenanceService
 from services.mission_service import MissionService
@@ -68,6 +69,7 @@ notification_service: Optional[EnhancedNotificationService] = None
 identity_service: Optional[IdentityService] = None
 maintenance_service: Optional[MaintenanceService] = None
 mission_service: Optional[MissionService] = None
+reward_service: Optional[RewardService] = None
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +140,7 @@ dp = app_context.dispatcher
 notification_service = app_context.notification_service
 db_manager = app_context.db_manager
 scheduler = app_context.scheduler
+rewards_repository = app_context.rewards_repository
 
 identity_service = IdentityService(
     bot=bot,
@@ -164,6 +167,12 @@ mission_service = MissionService(
     maintenance_service=maintenance_service,
     wolvesville_api_key=WOLVESVILLE_API_KEY,
     clan_id=CLAN_ID,
+    logger=logger,
+)
+
+reward_service = RewardService(
+    repository=rewards_repository,
+    notification_service=notification_service,
     logger=logger,
 )
 
@@ -210,6 +219,7 @@ register_user_flow_handlers(
     admin_ids=ADMIN_IDS,
     authorized_groups=AUTHORIZED_GROUPS,
     schedule_admin_notification=schedule_admin_notification,
+    reward_service=reward_service,
 )
 
 mission_service.register_handlers(dp)
@@ -335,6 +345,7 @@ async def main() -> None:
         maintenance_service=maintenance_service,
         mission_service=mission_service,
         identity_service=identity_service,
+        reward_service=reward_service,
         profile_auto_sync_minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
         logger=logger,
     )

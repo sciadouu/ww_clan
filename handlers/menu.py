@@ -24,6 +24,7 @@ class MenuHandlers:
         self.router = Router()
         self.router.message.register(self.start_command, Command("start"))
         self.router.message.register(self.menu_command, Command("menu"))
+        self.router.message.register(self.help_command, Command("help"))
         self.router.callback_query.register(
             self.handle_menu_callback, F.data.startswith("menu_")
         )
@@ -37,6 +38,9 @@ class MenuHandlers:
         keyboard = self._build_menu_keyboard()
         await message.answer("Scegli un'opzione:", reply_markup=keyboard)
         await self._delete_command_message(message)
+
+    async def help_command(self, message: types.Message) -> None:
+        await message.answer(self._help_text(), parse_mode="HTML")
 
     async def handle_menu_callback(
         self, callback: types.CallbackQuery, state: FSMContext
@@ -101,48 +105,57 @@ class MenuHandlers:
     def _help_text() -> str:
         return """<b>🤖 GUIDA COMPLETA BOT CLAN</b>
 
-<b>📋 FUNZIONI PRINCIPALI</b>
+<b>📌 NAVIGAZIONE RAPIDA</b>
+• <code>/start</code> – Avvia il bot e apre il menu principale interattivo
+• <code>/menu</code> – Richiama in qualsiasi momento le scorciatoie più utilizzate
+• <code>/help</code> – Elenco completo e sempre aggiornato delle funzionalità disponibili
 
-<b>👤 GIOCATORE</b>
-🔸 <i>Membro del Clan</i>: Visualizza lista paginata di tutti i membri
-🔸 <i>Ricerca Esterna</i>: Cerca qualsiasi giocatore per username
-🔸 <i>Profili Completi</i>: Statistiche, livello, clan, avatar
-🔸 <i>Avatar Gallery</i>: Visualizza tutti gli avatar del giocatore
+<b>🏆 SISTEMA RICOMPENSE</b>
+• <code>/classifica [periodo]</code> – Classifica dinamica dei punti premio (Top 10).<br>
+&nbsp;&nbsp;<i>Periodi supportati:</i> <code>totale</code>, <code>settimana</code>, <code>mese</code>, <code>oggi</code> e sinonimi.<br>
+&nbsp;&nbsp;<i>Dettagli inclusi:</i> punti del periodo, totale storico e icone degli achievement sbloccati.
+• <code>/progressi &lt;username&gt; [periodo]</code> – Scheda avanzata di un giocatore.<br>
+&nbsp;&nbsp;<i>Mostra:</i> punteggio complessivo, andamento nel periodo scelto, distribuzione per tipologia, ultimi eventi registrati e achievement ottenuti.
+• <i>Classifiche automatiche</i> – Aggiornamenti settimanali e mensili inviati in automatico agli amministratori via notifica.
+• <i>Notifiche achievement</i> – Ogni traguardo attiva un alert dedicato con riepilogo e bonus punti accreditati.
 
-<b>🏰 CLAN</b>
-🔸 <i>Clan Salvati</i>: Lista dei clan già cercati
-🔸 <i>Ricerca Diretta</i>: <code>/clan [ID]</code> per nuove ricerche
-🔸 <i>Info Complete</i>: Membri, risorse, statistiche clan
+<b>👤 GESTIONE GIOCATORI</b>
+• <i>Membro del Clan</i> – Elenco paginato con dati di profilo, stato online e attività recenti.
+• <i>Ricerca Esterna</i> – Trova qualsiasi giocatore partendo dallo username Wolvesville.
+• <i>Profili Completi</i> – Statistiche, livello, clan di appartenenza e galleria avatar sempre aggiornata.
+• <code>/collega</code> – Collega il profilo Telegram a quello di gioco per sbloccare funzioni avanzate e sincronizzazioni automatiche.
+
+<b>🏰 STRUMENTI CLAN</b>
+• <code>/clan [ID]</code> – Dossier completo su qualsiasi clan (membri, progressi, attività recenti).
+• <i>Clan salvati</i> – Accesso rapido alle ricerche più frequenti effettuate dal bot.
+• <i>Statistiche</i> – Analisi delle risorse condivise, andamento membri e confronto con i periodi precedenti.
 
 <b>⚔️ MISSIONI</b>
-🔸 <i>Skin Disponibili</i>: Visualizza missioni con anteprime
-🔸 <i>Skip Timer</i>: Salta tempo di attesa (solo admin)
-🔸 <i>Invio Automatico</i>: Ogni lunedì alle 11:00
+• <i>Skin disponibili</i> – Dettagli missione con immagini, costi e ricompense.
+• <i>Partecipanti</i> – Monitoraggio live dal menu «Player Missione».
+• <i>Skip timer</i> – Riduzione del tempo di attesa (riservata agli admin autorizzati).
+• <i>Supporto missioni</i> – Nuovo sistema premi per chi assiste le squadre durante i raid.
 
-<b>💰 BILANCIO DONAZIONI</b>
-🔸 <i>Calcolo Automatico</i>: Traccia donazioni e costi missioni
-🔸 <i>Visualizzazione</i>: Tabella ordinata di tutti i bilanci
-🔸 <i>Modifica Admin</i>: Solo amministratori possono modificare
-🔸 <i>Gestione Debiti</i>: Notifiche automatiche per uscite con debiti
+<b>💰 ECONOMIA</b>
+• <code>/balances</code> – Bilancio donazioni suddiviso per valuta e giocatore.
+• <i>Calcoli automatici</i> – Donazioni, costi missione e debiti gestiti in tempo reale.
+• <i>Ledger cronologico</i> – Storico contributi oro/gemme integrato con il sistema ricompense.
 
-<b>🎯 ABILITAZIONE MISSIONI</b>
-🔸 <i>Voti Automatici</i>: Abilita chi ha votato per una missione
-🔸 <i>Gestione Partecipanti</i>: Controllo completo dei partecipanti
-
-<b>🔧 FUNZIONI ADMIN</b>
-🔸 <i>Pulizia Database</i>: <code>/cleanup</code> - Rimuove duplicati
-🔸 <i>Controllo Uscite</i>: Monitora membri usciti dal clan
-🔸 <i>Gestione Automatica</i>: Sistema scheduler per manutenzione
+<b>🔧 COMANDI ADMIN</b>
+• <code>/cleanup</code> – Rimuove duplicati e sincronizza i dati tra le diverse collezioni MongoDB.
+• <i>Controllo uscite</i> – Notifiche automatiche per chi lascia il clan con debiti pendenti.
+• <i>Monitoraggio gruppi</i> – Alert immediati quando il bot entra in chat non autorizzate (con blacklist automatica).
 
 <b>🔄 AUTOMAZIONI</b>
-🔸 <i>Ledger Donazioni</i>: Aggiornamento ogni 5 minuti
-🔸 <i>Missioni Attive</i>: Calcolo costi ogni 5 minuti
-🔸 <i>Membri Clan</i>: Sincronizzazione ogni 3 giorni
-🔸 <i>Pulizia DB</i>: Rimozione duplicati ogni 24 ore
-🔸 <i>Controllo Uscite</i>: Verifica debiti ogni 6 ore
+• Ledger donazioni ogni 5 minuti
+• Calcolo missioni attive ogni 5 minuti
+• Sincronizzazione profili collegati ogni intervallo configurato
+• Pulizia database ogni 24 ore
+• Controllo uscite ogni 6 ore
+• Classifiche reward settimanali e mensili inviate automaticamente agli admin
 
 <b>💡 SUGGERIMENTI</b>
-• Usa <code>/start</code> o <code>/menu</code> per navigare
-• I comandi admin richiedono autorizzazione
-• Le modifiche ai bilanci sono tracciate automaticamente
-• Il bot mantiene cronologia delle ricerche clan"""
+• Usa il menu rapido per avviare i flussi guidati principali.
+• Specifica il periodo quando utilizzi <code>/classifica</code> o <code>/progressi</code> per filtrare i risultati.
+• Gli achievement sbloccati garantiscono punti bonus immediati registrati nello storico premi.
+• I comandi admin richiedono autorizzazioni dedicate: contatta il responsabile del clan per l'abilitazione."""

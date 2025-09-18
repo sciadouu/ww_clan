@@ -6,6 +6,7 @@ from typing import Callable, Iterable, Sequence
 
 from aiogram import Bot, Dispatcher
 
+from reward_service import RewardService
 from services.db_manager import MongoManager
 from services.identity_service import IdentityService
 from services.mission_service import MissionService
@@ -18,6 +19,7 @@ from .member_search import MemberSearchHandlers
 from .menu import MenuHandlers
 from .missions import MissionHandlers
 from .profile_link import ProfileLinkHandlers
+from .rewards import RewardHandlers
 
 
 def register_user_flow_handlers(
@@ -35,6 +37,7 @@ def register_user_flow_handlers(
     admin_ids: Sequence[int],
     authorized_groups: Sequence[int],
     schedule_admin_notification: Callable[..., None],
+    reward_service: RewardService,
 ) -> None:
     """Instantiate feature routers and register them on the dispatcher."""
 
@@ -82,6 +85,11 @@ def register_user_flow_handlers(
         member_check_flow=member_handlers.start_member_question,
     )
 
+    reward_handlers = RewardHandlers(
+        reward_service=reward_service,
+        logger=logger,
+    )
+
     routers: Iterable = (
         create_admin_router(
             bot=bot,
@@ -96,6 +104,7 @@ def register_user_flow_handlers(
         member_handlers.router,
         profile_link_handlers.router,
         menu_handlers.router,
+        reward_handlers.router,
     )
 
     for router in routers:
