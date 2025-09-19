@@ -39,6 +39,7 @@ class MemberListService:
             await self._remove_previous_message(chat_id, thread_id)
             sent_messages: List[types.Message] = []
             for index, text in enumerate(messages_payload):
+                sent = await message.answer(text, parse_mode="HTML")
                 sent = await message.answer(text)
                 sent_messages.append(sent)
                 if index + 1 < len(messages_payload):
@@ -126,6 +127,7 @@ class MemberListService:
                         sent = await self.bot.send_message(
                             chat_id,
                             text,
+                            parse_mode="HTML",
                             message_thread_id=thread_id,
                         )
                     except TelegramForbiddenError:
@@ -181,6 +183,11 @@ class MemberListService:
         messages: List[str] = []
         for index, entry in enumerate(entries, start=1):
             prefix = "📋 <b>Lista membri del clan</b>\n" if index == 1 else ""
+            contact = entry.get("telegram_contact") or entry.get("telegram_tag") or "—"
+            line = (
+                f"{index}. Game Name: {entry['game_name']} | "
+                f"Username: {entry['telegram_name']} | "
+                f"tag telegram: {contact}"
             line = (
                 f"{index}. Game Name: {entry['game_name']} | "
                 f"Username: {entry['telegram_name']} | "
@@ -216,6 +223,11 @@ class MemberListService:
                     telegram_name,
                     telegram_id,
                 )
+                telegram_tag = self._format_tag(telegram_username)
+            else:
+                telegram_name = "non collegato"
+                telegram_contact = "—"
+                telegram_tag = "—"
             else:
                 telegram_name = "non collegato"
                 telegram_contact = "—"
@@ -224,6 +236,7 @@ class MemberListService:
                 {
                     "game_name": game_name,
                     "telegram_name": telegram_name,
+                    "telegram_tag": telegram_tag,
                     "telegram_contact": telegram_contact,
                 }
             )
