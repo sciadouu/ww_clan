@@ -40,6 +40,7 @@ class MemberListService:
             sent_messages: List[types.Message] = []
             for index, text in enumerate(messages_payload):
                 sent = await message.answer(text, parse_mode="HTML")
+                sent = await message.answer(text)
                 sent_messages.append(sent)
                 if index + 1 < len(messages_payload):
                     await asyncio.sleep(0.05)
@@ -187,6 +188,11 @@ class MemberListService:
                 f"{index}. Game Name: {entry['game_name']} | "
                 f"Username: {entry['telegram_name']} | "
                 f"tag telegram: {contact}"
+            line = (
+                f"{index}. Game Name: {entry['game_name']} | "
+                f"Username: {entry['telegram_name']} | "
+                f"tag telegram: {entry['telegram_contact']}"
+                f"tag telegram(se presente): {entry['telegram_tag']}"
             )
             messages.append(f"{prefix}{line}")
         return messages
@@ -222,6 +228,9 @@ class MemberListService:
                 telegram_name = "non collegato"
                 telegram_contact = "—"
                 telegram_tag = "—"
+            else:
+                telegram_name = "non collegato"
+                telegram_contact = "—"
 
             entries.append(
                 {
