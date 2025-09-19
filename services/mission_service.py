@@ -16,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from services.db_manager import MongoManager
+from reward_service import RewardService
 from services.identity_service import IdentityService
 from services.maintenance_service import MaintenanceService
 
@@ -40,10 +41,79 @@ class MissionService:
     logger: logging.Logger
     clan_chat_id: Optional[int] = None
     clan_topic_id: Optional[int] = None
+    reward_service: Optional[RewardService] = None
 
     # ---------------------------------------------------------------------
     # Public API used by other components (scheduler, commands, services)
     # ---------------------------------------------------------------------
+    async def _reward_mission_participants(
+        self,
+        identities: Sequence[Dict[str, Any]],
+        *,
+        mission_type: str,
+        mission_id: Optional[str],
+        source: str,
+        outcome: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        event_id: Optional[str] = None,
+    ) -> None:
+        """Assegna i punti premio ai partecipanti della missione."""
+
+        if not self.reward_service or not identities:
+            return
+
+        outcome_normalized = (outcome or "").lower()
+        success_outcomes = {
+            "success",
+            "completed",
+            "complete",
+            "victory",
+            "auto_processed",
+            "processed",
+        }
+        is_success = outcome_normalized in success_outcomes
+
+        base_metadata: Dict[str, Any] = {
+            "mission_id": mission_id,
+            "mission_type": mission_type,
+            "mission_source": source,
+            "mission_outcome": outcome,
+        }
+        if metadata:
+            base_metadata.update(metadata)
+        if event_id:
+            base_metadata["mission_event_id"] = event_id
+
+        for identity in identities:
+            username = identity.get("resolved_username")
+            if not username:
+                continue
+
+            personal_metadata = dict(base_metadata)
+            if identity.get("original_username"):
+                personal_metadata["original_username"] = identity.get(
+                    "original_username"
+                )
+            if identity.get("match"):
+                personal_metadata["identity_match"] = identity.get("match")
+
+            try:
+                await self.reward_service.award_points(
+                    username,
+                    "MISSION_PARTICIPATION",
+                    metadata=personal_metadata,
+                )
+                if is_success:
+                    await self.reward_service.award_points(
+                        username,
+                        "MISSION_SUCCESS",
+                        metadata={**personal_metadata, "success": True},
+                    )
+            except Exception as exc:  # pragma: no cover - log difensivo
+                self.logger.warning(
+                    "Assegnazione punti missione fallita per %s: %s", username, exc
+                )
+
     async def process_mission(
         self,
         participants: Sequence[str],
@@ -195,6 +265,16 @@ class MissionService:
                 event_id,
                 participant_count,
             )
+
+        await self._reward_mission_participants(
+            resolved_identities,
+            mission_type=mission_type,
+            mission_id=mission_id,
+            source=source,
+            outcome=outcome,
+            metadata=metadata_payload,
+            event_id=event_id,
+        )
 
         return event_id
 
@@ -380,6 +460,16 @@ class MissionService:
             "Missione %s processata e registrata (event_id=%s).",
             mission_id,
             event_id or "N/A",
+        )
+
+        await self._reward_mission_participants(
+            resolved_identities,
+            mission_type=mission_type,
+            mission_id=mission_id,
+            source="active_mission",
+            outcome="auto_processed",
+            metadata=metadata,
+            event_id=event_id,
         )
 
     async def send_weekly_mission_skin(self) -> None:

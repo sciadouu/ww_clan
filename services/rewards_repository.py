@@ -129,6 +129,46 @@ class RewardsRepository:
         await self._history.insert_one(payload)
         return True
 
+    async def reset_all_points(self, *, reason: Optional[str] = None) -> int:
+        """Azzera i punti premio per tutti gli utenti registrando un evento di reset."""
+
+        users = await self._users.find({"reward_points": {"$ne": 0}}).to_list(length=None)
+        if not users:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        reset_count = 0
+
+        for user in users:
+            username = user.get("username")
+            if not username:
+                continue
+
+            current_points = int(user.get("reward_points", 0) or 0)
+
+            await self._users.update_one(
+                {"username": username},
+                {"$set": {"reward_points": 0}},
+            )
+
+            payload: Dict[str, Any] = {
+                "username": username,
+                "event_type": "reset",
+                "points": -current_points,
+                "running_total": 0,
+                "created_at": now,
+                "metadata": {
+                    "previous_total": current_points,
+                },
+            }
+            if reason:
+                payload["metadata"]["reason"] = reason
+
+            await self._history.insert_one(payload)
+            reset_count += 1
+
+        return reset_count
+
     # ------------------------------------------------------------------
     # Operazioni di lettura
     # ------------------------------------------------------------------

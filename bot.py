@@ -38,6 +38,7 @@ except ImportError as exc:  # pragma: no cover - il progetto può funzionare sen
     MIDDLEWARE_AVAILABLE = False
 
 from reward_service import RewardService
+from statistics_service import StatisticsService
 from services.identity_service import IdentityService
 from services.maintenance_service import MaintenanceService
 from services.mission_service import MissionService
@@ -70,6 +71,7 @@ identity_service: Optional[IdentityService] = None
 maintenance_service: Optional[MaintenanceService] = None
 mission_service: Optional[MissionService] = None
 reward_service: Optional[RewardService] = None
+statistics_service: Optional[StatisticsService] = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,12 @@ identity_service = IdentityService(
     logger=logger,
 )
 
+reward_service = RewardService(
+    repository=rewards_repository,
+    notification_service=notification_service,
+    logger=logger,
+)
+
 maintenance_service = MaintenanceService(
     bot=bot,
     db_manager=db_manager,
@@ -157,6 +165,7 @@ maintenance_service = MaintenanceService(
     clan_id=CLAN_ID,
     wolvesville_api_key=WOLVESVILLE_API_KEY,
     admin_ids=ADMIN_IDS,
+    reward_service=reward_service,
     logger=logger,
 )
 
@@ -168,10 +177,11 @@ mission_service = MissionService(
     wolvesville_api_key=WOLVESVILLE_API_KEY,
     clan_id=CLAN_ID,
     logger=logger,
+    reward_service=reward_service,
 )
 
-reward_service = RewardService(
-    repository=rewards_repository,
+statistics_service = StatisticsService(
+    db_manager=db_manager,
     notification_service=notification_service,
     logger=logger,
 )
@@ -346,6 +356,7 @@ async def main() -> None:
         mission_service=mission_service,
         identity_service=identity_service,
         reward_service=reward_service,
+        statistics_service=statistics_service,
         profile_auto_sync_minutes=PROFILE_AUTO_SYNC_INTERVAL_MINUTES,
         logger=logger,
     )
