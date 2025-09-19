@@ -184,6 +184,7 @@ class MemberListService:
             line = (
                 f"{index}. Game Name: {entry['game_name']} | "
                 f"Username: {entry['telegram_name']} | "
+                f"tag telegram: {entry['telegram_contact']}"
                 f"tag telegram(se presente): {entry['telegram_tag']}"
             )
             messages.append(f"{prefix}{line}")
@@ -208,17 +209,22 @@ class MemberListService:
             if profile:
                 telegram_name_raw = profile.get("full_name") or profile.get("telegram_username")
                 telegram_name = self._escape(telegram_name_raw) if telegram_name_raw else "—"
-                telegram_tag_raw = profile.get("telegram_username")
-                telegram_tag = self._format_tag(telegram_tag_raw)
+                telegram_username = profile.get("telegram_username")
+                telegram_id = profile.get("telegram_id")
+                telegram_contact = self._format_contact(
+                    telegram_username,
+                    telegram_name,
+                    telegram_id,
+                )
             else:
                 telegram_name = "non collegato"
-                telegram_tag = "—"
+                telegram_contact = "—"
 
             entries.append(
                 {
                     "game_name": game_name,
                     "telegram_name": telegram_name,
-                    "telegram_tag": telegram_tag,
+                    "telegram_contact": telegram_contact,
                 }
             )
 
@@ -315,4 +321,20 @@ class MemberListService:
         clean = username.strip()
         if not clean:
             return "—"
-        return clean if clean.startswith("@") else f"@{clean}"
+        if clean.startswith("@"):
+            clean = clean[1:]
+        escaped = MemberListService._escape(clean)
+        return f"@{escaped}" if escaped else "—"
+
+    @staticmethod
+    def _format_contact(
+        username: Optional[str], display_name: str, telegram_id: Optional[int]
+    ) -> str:
+        tag = MemberListService._format_tag(username)
+        if tag != "—":
+            return tag
+        if telegram_id and display_name and display_name != "—":
+            return f'<a href="tg://user?id={telegram_id}">{display_name}</a>'
+        if telegram_id:
+            return f'<a href="tg://user?id={telegram_id}">Profilo Telegram</a>'
+        return "—"
