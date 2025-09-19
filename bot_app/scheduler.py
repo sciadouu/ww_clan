@@ -6,6 +6,7 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from reward_service import RewardService
+from statistics_service import StatisticsService
 from services.identity_service import IdentityService
 from services.maintenance_service import MaintenanceService
 from services.mission_service import MissionService
@@ -18,6 +19,7 @@ def setup_scheduler(
     mission_service: MissionService,
     identity_service: IdentityService,
     reward_service: RewardService,
+    statistics_service: StatisticsService,
     profile_auto_sync_minutes: int,
     logger,
 ) -> AsyncIOScheduler:
@@ -90,6 +92,34 @@ def setup_scheduler(
         hour=9,
         minute=5,
         timezone="Europe/Rome",
+    )
+
+    scheduler.add_job(
+        statistics_service.publish_weekly_donation_report,
+        "cron",
+        day_of_week="mon",
+        hour=8,
+        minute=30,
+        timezone="Europe/Rome",
+    )
+
+    scheduler.add_job(
+        statistics_service.publish_monthly_donation_report,
+        "cron",
+        day=1,
+        hour=8,
+        minute=45,
+        timezone="Europe/Rome",
+    )
+
+    scheduler.add_job(
+        reward_service.reset_all_points,
+        "cron",
+        day=1,
+        hour=9,
+        minute=30,
+        timezone="Europe/Rome",
+        kwargs={"reason": "reset mensile automatico"},
     )
 
     if not scheduler.running:

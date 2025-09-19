@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Sequence
+from typing import Optional, Sequence
 
 import aiohttp
 
 from services.identity_service import IdentityService
+from reward_service import RewardService
 
 
 class MaintenanceService:
@@ -23,6 +24,7 @@ class MaintenanceService:
         clan_id: str,
         wolvesville_api_key: str,
         admin_ids: Sequence[int],
+        reward_service: Optional[RewardService] = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._bot = bot
@@ -32,6 +34,7 @@ class MaintenanceService:
         self._wolvesville_api_key = wolvesville_api_key
         self._admin_ids = tuple(admin_ids)
         self._logger = logger or logging.getLogger(__name__)
+        self._reward_service = reward_service
 
     # ------------------------------------------------------------------
     # Operazioni di housekeeping
@@ -310,6 +313,34 @@ class MaintenanceService:
                     original_username=original_username,
                     match_source=identity.get("match"),
                 )
+
+                if self._reward_service:
+                    reward_metadata = {
+                        "ledger_record_id": record_id,
+                        "source": "ledger_sync",
+                        "occurred_at": occurred_at,
+                    }
+                    try:
+                        if gold_amount > 0:
+                            await self._reward_service.award_points(
+                                resolved_username,
+                                "DONATION_ORO",
+                                amount=gold_amount,
+                                metadata={**reward_metadata, "currency": "Oro"},
+                            )
+                        if gems_amount > 0:
+                            await self._reward_service.award_points(
+                                resolved_username,
+                                "DONATION_GEM",
+                                amount=gems_amount,
+                                metadata={**reward_metadata, "currency": "Gem"},
+                            )
+                    except Exception as exc:  # pragma: no cover - log difensivo
+                        self._logger.warning(
+                            "Impossibile assegnare punti reward per il ledger %s: %s",
+                            record_id,
+                            exc,
+                        )
 
             await self._db_manager.mark_ledger_processed(
                 record_id, raw_record=record, processed_at=occurred_at

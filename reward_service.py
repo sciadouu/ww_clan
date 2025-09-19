@@ -556,6 +556,29 @@ class RewardService:
 
         return unlocked
 
+    async def reset_all_points(self, *, reason: Optional[str] = None) -> Dict[str, Any]:
+        """Resetta tutti i punti premio notificando l'operazione agli admin."""
+
+        reset_count = await self.repository.reset_all_points(reason=reason)
+        self.logger.info("Reset punti completato per %s utenti", reset_count)
+
+        if self.notification_service:
+            try:
+                reason_text = f" Motivo: {reason}" if reason else ""
+                message = (
+                    "♻️ *Reset punti completato*\n\n"
+                    f"Utenti aggiornati: {reset_count}.{reason_text}"
+                ).strip()
+                await self.notification_service.send_admin_notification(
+                    message,
+                    notification_type=NotificationType.WARNING,
+                    disable_rate_limit=True,
+                )
+            except Exception as exc:  # pragma: no cover - log difensivo
+                self.logger.warning("Invio notifica reset punti fallito: %s", exc)
+
+        return {"reset_count": reset_count}
+
     async def get_leaderboard(
         self,
         *,
