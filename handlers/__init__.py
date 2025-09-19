@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher
 from reward_service import RewardService
 from services.db_manager import MongoManager
 from services.identity_service import IdentityService
+from services.member_list_service import MemberListService
 from services.mission_service import MissionService
 from services.notification_service import EnhancedNotificationService
 
@@ -17,6 +18,7 @@ from .balances import BalancesHandlers
 from .clan import ClanHandlers
 from .member_search import MemberSearchHandlers
 from .menu import MenuHandlers
+from .member_list import MemberListHandlers
 from .missions import MissionHandlers
 from .profile_link import ProfileLinkHandlers
 from .rewards import RewardHandlers
@@ -38,6 +40,8 @@ def register_user_flow_handlers(
     authorized_groups: Sequence[int],
     schedule_admin_notification: Callable[..., None],
     reward_service: RewardService,
+    member_list_service: MemberListService,
+    group_middleware_active: bool,
 ) -> None:
     """Instantiate feature routers and register them on the dispatcher."""
 
@@ -90,6 +94,11 @@ def register_user_flow_handlers(
         logger=logger,
     )
 
+    member_list_handlers = MemberListHandlers(
+        member_list_service=member_list_service,
+        logger=logger,
+    )
+
     routers: Iterable = (
         create_admin_router(
             bot=bot,
@@ -97,6 +106,7 @@ def register_user_flow_handlers(
             authorized_groups=set(authorized_groups),
             schedule_admin_notification=schedule_admin_notification,
             logger=logger,
+            skip_unauthorized_handling=group_middleware_active,
         ),
         mission_handlers.router,
         balances_handlers.router,
@@ -105,6 +115,7 @@ def register_user_flow_handlers(
         profile_link_handlers.router,
         menu_handlers.router,
         reward_handlers.router,
+        member_list_handlers.router,
     )
 
     for router in routers:

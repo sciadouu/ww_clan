@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import aiohttp
 from aiogram import types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound
-
-from services.notification_service import NotificationType
-
 
 def format_telegram_username(username: Optional[str]) -> str:
     """Restituisce uno username Telegram formattato con @ oppure un segnaposto."""
@@ -75,21 +72,23 @@ class IdentityService:
         db_manager,
         wolvesville_api_key: str,
         schedule_admin_notification: Callable[..., None],
+        member_list_refresh: Optional[Callable[[], Awaitable[None]]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._bot = bot
         self._db_manager = db_manager
         self._wolvesville_api_key = wolvesville_api_key
         self._schedule_admin_notification = schedule_admin_notification
+        self._member_list_refresh = member_list_refresh
         self._logger = logger or logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
     # Helper per notifiche e sincronizzazione
     # ------------------------------------------------------------------
-    def handle_telegram_sync_result(
+    async def handle_telegram_sync_result(
         self, result: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
-        """Invia notifiche se cambia lo username Telegram e restituisce il profilo."""
+        """Gestisce gli aggiornamenti dello username Telegram e ritorna il profilo."""
 
         if not result:
             return None
@@ -105,23 +104,20 @@ class IdentityService:
                     result.get("previous_telegram_username")
                 )
                 new_username = format_telegram_username(profile.get("telegram_username"))
-                message = (
-                    "♻️ **Aggiornamento username Telegram**\n\n"
-                    f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
-                    f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-                    f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
+                self._logger.info(
+                    "Username Telegram aggiornato per %s: %s → %s",
+                    game_username,
+                    old_username,
+                    new_username,
                 )
-                self._schedule_admin_notification(
-                    message,
-                    notification_type=NotificationType.INFO,
-                )
+                await self._trigger_member_list_refresh()
 
         return profile
 
-    def handle_profile_link_result(
+    async def handle_profile_link_result(
         self, result: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
-        """Analizza il linking del profilo e notifica variazioni allo username di gioco."""
+        """Analizza il linking del profilo e gestisce variazioni sugli username."""
 
         if not result or result.get("conflict"):
             return result.get("profile") if result else None
@@ -130,21 +126,42 @@ class IdentityService:
         if profile is None:
             return None
 
+        refresh_needed = False
+
         if result.get("game_username_changed") and result.get("previous_game_username"):
             telegram_display = format_telegram_username(profile.get("telegram_username"))
-            message = (
-                "♻️ **Aggiornamento username Wolvesville**\n\n"
-                f"💬 **Telegram:** {format_markdown_code(telegram_display)}\n"
-                f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-                f"🆔 **Wolvesville ID:** {format_markdown_code(profile.get('wolvesville_id'))}\n"
-                f"🔁 **Username:** {format_markdown_code(result.get('previous_game_username'))} → {format_markdown_code(profile.get('game_username'))}"
+            self._logger.info(
+                "Username Wolvesville aggiornato: %s → %s (Telegram %s)",
+                result.get("previous_game_username"),
+                profile.get("game_username"),
+                telegram_display,
             )
-            self._schedule_admin_notification(
-                message,
-                notification_type=NotificationType.INFO,
-            )
+            refresh_needed = True
+
+        if result.get("telegram_username_changed"):
+            refresh_needed = True
+
+        if result.get("created"):
+            refresh_needed = True
+
+        if refresh_needed:
+            await self._trigger_member_list_refresh()
 
         return profile
+
+    async def _trigger_member_list_refresh(self) -> None:
+        """Richiede l'aggiornamento della lista membri se configurato."""
+
+        if not self._member_list_refresh:
+            return
+
+        try:
+            await self._member_list_refresh()
+        except Exception as exc:  # pragma: no cover - log diagnostico
+            self._logger.warning(
+                "Aggiornamento lista membri non riuscito: %s",
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # API pubbliche
@@ -228,27 +245,7 @@ class IdentityService:
         if not result or result.get("created"):
             return
 
-        self.handle_telegram_sync_result(result)
-        if (
-            result.get("telegram_username_changed")
-            and result.get("profile")
-        ):
-            profile = result["profile"]
-            game_username = profile.get("game_username")
-            if not game_username:
-                return
-            old_username = format_telegram_username(result.get("previous_telegram_username"))
-            new_username = format_telegram_username(profile.get("telegram_username"))
-            message = (
-                "♻️ **Aggiornamento username Telegram**\n\n"
-                f"🎮 **Giocatore:** {format_markdown_code(game_username)}\n"
-                f"🆔 **Telegram ID:** {format_markdown_code(profile.get('telegram_id'))}\n"
-                f"🔁 **Username:** {format_markdown_code(old_username)} → {format_markdown_code(new_username)}"
-            )
-            self._schedule_admin_notification(
-                message,
-                notification_type=NotificationType.INFO,
-            )
+        await self.handle_telegram_sync_result(result)
 
     async def refresh_linked_profiles(self) -> None:
         """Sincronizza periodicamente gli username Telegram e Wolvesville già collegati."""
@@ -304,7 +301,7 @@ class IdentityService:
                             "Sync Telegram fallito per %s: %s", telegram_id, exc
                         )
                     else:
-                        updated_profile = self.handle_telegram_sync_result(result)
+                        updated_profile = await self.handle_telegram_sync_result(result)
                         if updated_profile:
                             latest_profile = updated_profile
 
@@ -358,7 +355,7 @@ class IdentityService:
                     )
                     continue
 
-                updated_profile = self.handle_profile_link_result(link_result)
+                updated_profile = await self.handle_profile_link_result(link_result)
                 if updated_profile:
                     latest_profile = updated_profile
 

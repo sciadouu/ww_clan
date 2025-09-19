@@ -21,6 +21,7 @@ def create_admin_router(
     authorized_groups: Set[int],
     schedule_admin_notification: Callable[[str], None],
     logger,
+    skip_unauthorized_handling: bool = False,
 ) -> Router:
     """Return a router that reacts to bot joins and removals from chats."""
 
@@ -55,6 +56,11 @@ def create_admin_router(
         logger.info("Bot aggiunto alla chat: %s (%s)", chat_id, chat_title)
 
         if chat_id not in authorized_groups:
+            if skip_unauthorized_handling:
+                logger.debug(
+                    "Join in gruppo non autorizzato gestito dal middleware, nessuna azione dal router"
+                )
+                return
             if notification_service.is_group_blacklisted(chat_id):
                 logger.info("Gruppo %s in blacklist, uscita immediata", chat_id)
                 try:
