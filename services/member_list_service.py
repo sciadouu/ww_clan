@@ -195,6 +195,11 @@ class MemberListService:
             game_name = entry.get("game_name", "—")
             telegram_name = entry.get("telegram_name", "—")
             line = f"{index}. Game Name: {game_name} | Username: {telegram_name} | tag telegram: {contact}"
+            line = (
+                f"{index}. Game Name: {entry['game_name']} | "
+                f"Username: {entry['telegram_name']} | "
+                f"tag telegram: {contact}"
+            )
             messages.append(f"{prefix}{line}")
         return messages
 
