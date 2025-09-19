@@ -1146,23 +1146,30 @@ class MongoManager:
     async def upsert_member_list_message(
         self,
         chat_id: int,
-        message_id: int,
+        message_ids: Sequence[int],
         *,
         message_thread_id: Optional[int] = None,
     ) -> None:
         """Crea o aggiorna la registrazione del messaggio lista membri."""
 
         now = datetime.now(timezone.utc)
+        safe_ids = [int(mid) for mid in message_ids if isinstance(mid, int)]
+        update_payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_ids": safe_ids,
+            "message_thread_id": message_thread_id,
+            "updated_at": now,
+        }
+        update_statement: Dict[str, Any] = {"$set": update_payload}
+
+        if safe_ids:
+            update_payload["message_id"] = safe_ids[0]
+        else:
+            update_statement.setdefault("$unset", {})["message_id"] = ""
+
         await self.member_list_messages_col.update_one(
             {"chat_id": chat_id, "message_thread_id": message_thread_id},
-            {
-                "$set": {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "message_thread_id": message_thread_id,
-                    "updated_at": now,
-                }
-            },
+            update_statement,
             upsert=True,
         )
 
