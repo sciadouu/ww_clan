@@ -6,11 +6,15 @@ import asyncio
 import html
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
 from aiogram import Bot, types
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 
 from services.db_manager import MongoManager
 
@@ -24,6 +28,9 @@ class MemberListService:
     wolvesville_api_key: str
     clan_id: str
     logger: logging.Logger
+
+    _MESSAGE_DELAY_SECONDS = 1.05
+    _RETRY_AFTER_PADDING = 0.1
 
     def __post_init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -39,11 +46,11 @@ class MemberListService:
             await self._remove_previous_message(chat_id, thread_id)
             sent_messages: List[types.Message] = []
             for index, text in enumerate(messages_payload):
-                sent = await message.answer(text, parse_mode="HTML")
-                sent = await message.answer(text)
+                send_operation = lambda text=text: message.answer(text, parse_mode="HTML")
+                sent = await self._send_with_retry(send_operation)
                 sent_messages.append(sent)
                 if index + 1 < len(messages_payload):
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(self._MESSAGE_DELAY_SECONDS)
 
             message_ids = [sent.message_id for sent in sent_messages]
             if message_ids:
@@ -124,12 +131,13 @@ class MemberListService:
                 sent_messages: List[types.Message] = []
                 for index, text in enumerate(messages_payload):
                     try:
-                        sent = await self.bot.send_message(
+                        send_operation = lambda text=text: self.bot.send_message(
                             chat_id,
                             text,
                             parse_mode="HTML",
                             message_thread_id=thread_id,
                         )
+                        sent = await self._send_with_retry(send_operation)
                     except TelegramForbiddenError:
                         await self.db_manager.delete_member_list_message(chat_id, thread_id)
                         self.logger.info(
@@ -150,7 +158,7 @@ class MemberListService:
 
                     sent_messages.append(sent)
                     if index + 1 < len(messages_payload):
-                        await asyncio.sleep(0.05)
+                        await asyncio.sleep(self._MESSAGE_DELAY_SECONDS)
 
                 if should_remove_entry:
                     for sent in sent_messages:
@@ -184,16 +192,9 @@ class MemberListService:
         for index, entry in enumerate(entries, start=1):
             prefix = "📋 <b>Lista membri del clan</b>\n" if index == 1 else ""
             contact = entry.get("telegram_contact") or entry.get("telegram_tag") or "—"
-            line = (
-                f"{index}. Game Name: {entry['game_name']} | "
-                f"Username: {entry['telegram_name']} | "
-                f"tag telegram: {contact}"
-            line = (
-                f"{index}. Game Name: {entry['game_name']} | "
-                f"Username: {entry['telegram_name']} | "
-                f"tag telegram: {entry['telegram_contact']}"
-                f"tag telegram(se presente): {entry['telegram_tag']}"
-            )
+            game_name = entry.get("game_name", "—")
+            telegram_name = entry.get("telegram_name", "—")
+            line = f"{index}. Game Name: {game_name} | Username: {telegram_name} | tag telegram: {contact}"
             messages.append(f"{prefix}{line}")
         return messages
 
@@ -228,9 +229,6 @@ class MemberListService:
                 telegram_name = "non collegato"
                 telegram_contact = "—"
                 telegram_tag = "—"
-            else:
-                telegram_name = "non collegato"
-                telegram_contact = "—"
 
             entries.append(
                 {
@@ -322,6 +320,21 @@ class MemberListService:
 
         if remove_record:
             await self.db_manager.delete_member_list_message(chat_id, message_thread_id)
+
+    async def _send_with_retry(
+        self, operation: Callable[[], Awaitable[types.Message]]
+    ) -> types.Message:
+        while True:
+            try:
+                return await operation()
+            except TelegramRetryAfter as exc:
+                delay = float(exc.retry_after) + self._RETRY_AFTER_PADDING
+                delay = max(delay, self._MESSAGE_DELAY_SECONDS)
+                self.logger.info(
+                    "Limite di invio Telegram raggiunto, attesa di %.2f secondi",
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     @staticmethod
     def _escape(value: str) -> str:
