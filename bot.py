@@ -41,6 +41,7 @@ from reward_service import RewardService
 from statistics_service import StatisticsService
 from services.identity_service import IdentityService
 from services.maintenance_service import MaintenanceService
+from services.member_list_service import MemberListService
 from services.mission_service import MissionService
 from services.notification_service import (
     EnhancedNotificationService,
@@ -72,6 +73,7 @@ maintenance_service: Optional[MaintenanceService] = None
 mission_service: Optional[MissionService] = None
 reward_service: Optional[RewardService] = None
 statistics_service: Optional[StatisticsService] = None
+member_list_service: Optional[MemberListService] = None
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +146,20 @@ db_manager = app_context.db_manager
 scheduler = app_context.scheduler
 rewards_repository = app_context.rewards_repository
 
+member_list_service = MemberListService(
+    bot=bot,
+    db_manager=db_manager,
+    wolvesville_api_key=WOLVESVILLE_API_KEY,
+    clan_id=CLAN_ID,
+    logger=logger,
+)
+
 identity_service = IdentityService(
     bot=bot,
     db_manager=db_manager,
     wolvesville_api_key=WOLVESVILLE_API_KEY,
     schedule_admin_notification=schedule_admin_notification,
+    member_list_refresh=member_list_service.refresh_member_lists,
     logger=logger,
 )
 
@@ -230,6 +241,12 @@ register_user_flow_handlers(
     authorized_groups=AUTHORIZED_GROUPS,
     schedule_admin_notification=schedule_admin_notification,
     reward_service=reward_service,
+    member_list_service=member_list_service,
+    group_middleware_active=(
+        MIDDLEWARE_AVAILABLE
+        and GroupAuthorizationMiddleware is not None
+        and notification_service is not None
+    ),
 )
 
 mission_service.register_handlers(dp)

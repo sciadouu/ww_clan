@@ -216,7 +216,8 @@ class ProfileLinkHandlers:
             )
             return
 
-        profile = result.get("profile") or {}
+        updated_profile = await self.identity_service.handle_profile_link_result(result)
+        profile = updated_profile or result.get("profile") or {}
         telegram_username_display = format_telegram_username(
             profile.get("telegram_username")
         )

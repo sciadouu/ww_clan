@@ -30,6 +30,9 @@ class MongoManager:
         self.missions_history_col: AsyncIOMotorCollection = self._database["missions_history"]
         self.player_profiles_col: AsyncIOMotorCollection = self._database["player_profiles"]
         self.rewards_history_col: AsyncIOMotorCollection = self._database["rewards_history"]
+        self.member_list_messages_col: AsyncIOMotorCollection = self._database[
+            "member_list_messages"
+        ]
 
     @property
     def database(self) -> AsyncIOMotorDatabase:
@@ -803,6 +806,30 @@ class MongoManager:
         normalized = game_username.strip().lower()
         return await self.player_profiles_col.find_one({"game_username_lower": normalized})
 
+    async def get_profiles_by_game_usernames(
+        self, game_usernames: Sequence[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Recupera in blocco i profili per una lista di username di gioco."""
+
+        normalized = {
+            username.strip().lower()
+            for username in game_usernames
+            if isinstance(username, str) and username.strip()
+        }
+        if not normalized:
+            return {}
+
+        cursor = self.player_profiles_col.find(
+            {"game_username_lower": {"$in": list(normalized)}}
+        )
+        profiles = await cursor.to_list(length=None)
+        mapping: Dict[str, Dict[str, Any]] = {}
+        for profile in profiles:
+            key = (profile.get("game_username_lower") or "").strip()
+            if key:
+                mapping[key] = profile
+        return mapping
+
     async def resolve_profile_by_game_alias(
         self, game_username: str
     ) -> Optional[Dict[str, Any]]:
@@ -1107,3 +1134,49 @@ class MongoManager:
             changes["verification"] = verification_payload
 
         return changes
+
+    async def get_member_list_message(
+        self, chat_id: int, message_thread_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """Recupera il record del messaggio lista membri per chat/thread."""
+
+        query: Dict[str, Any] = {"chat_id": chat_id, "message_thread_id": message_thread_id}
+        return await self.member_list_messages_col.find_one(query)
+
+    async def upsert_member_list_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        message_thread_id: Optional[int] = None,
+    ) -> None:
+        """Crea o aggiorna la registrazione del messaggio lista membri."""
+
+        now = datetime.now(timezone.utc)
+        await self.member_list_messages_col.update_one(
+            {"chat_id": chat_id, "message_thread_id": message_thread_id},
+            {
+                "$set": {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "message_thread_id": message_thread_id,
+                    "updated_at": now,
+                }
+            },
+            upsert=True,
+        )
+
+    async def list_member_list_messages(self) -> List[Dict[str, Any]]:
+        """Restituisce tutti i messaggi registrati per la lista membri."""
+
+        cursor = self.member_list_messages_col.find({})
+        return await cursor.to_list(length=None)
+
+    async def delete_member_list_message(
+        self, chat_id: int, message_thread_id: Optional[int]
+    ) -> None:
+        """Elimina il record del messaggio lista membri per la chat/thread indicata."""
+
+        await self.member_list_messages_col.delete_one(
+            {"chat_id": chat_id, "message_thread_id": message_thread_id}
+        )

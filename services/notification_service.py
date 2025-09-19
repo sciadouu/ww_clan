@@ -37,8 +37,9 @@ class EnhancedNotificationService:
         # Rate limiting e tracking blacklist
         self.last_notification_time = {}
         self.min_interval = 5
-        self.group_blacklist = {}  # {group_id: {"attempts": count, "blacklisted": bool}}
+        self.group_blacklist = {}
         self.max_attempts = 3
+        self.duplicate_interval_seconds = 3
 
     def get_local_timestamp(self) -> str:
         """
@@ -160,18 +161,34 @@ class EnhancedNotificationService:
         """
         # Inizializza gruppo nel tracking blacklist se non esiste
         if chat_id not in self.group_blacklist:
-            self.group_blacklist[chat_id] = {"attempts": 0, "blacklisted": False}
+            self.group_blacklist[chat_id] = {
+                "attempts": 0,
+                "blacklisted": False,
+                "last_attempt_at": None,
+            }
+
+        entry = self.group_blacklist[chat_id]
+        now = datetime.now(timezone.utc)
+        last_attempt_at = entry.get("last_attempt_at")
+        if last_attempt_at and (now - last_attempt_at).total_seconds() < self.duplicate_interval_seconds:
+            entry["last_attempt_at"] = now
+            self.logger.debug(
+                "Tentativo duplicato ignorato per il gruppo non autorizzato %s", chat_id
+            )
+            return
+
+        entry["last_attempt_at"] = now
 
         # Incrementa tentativi
-        self.group_blacklist[chat_id]["attempts"] += 1
-        attempts = self.group_blacklist[chat_id]["attempts"]
+        entry["attempts"] += 1
+        attempts = entry["attempts"]
 
         # Controlla se deve essere inserito in blacklist
         should_blacklist = attempts >= self.max_attempts
 
-        if should_blacklist and not self.group_blacklist[chat_id]["blacklisted"]:
+        if should_blacklist and not entry["blacklisted"]:
             # Inserisce in blacklist
-            self.group_blacklist[chat_id]["blacklisted"] = True
+            entry["blacklisted"] = True
             message = (
                 f"🚫 **GRUPPO INSERITO IN BLACKLIST**\n\n"
                 f"👥 **Gruppo:** {chat_title}\n"
@@ -194,7 +211,7 @@ class EnhancedNotificationService:
                 f"📅 **Timestamp:** {self.get_local_timestamp()}"
             )
         else:
-            # Gruppo è in blacklist, non inviare notifica
+            # Gruppo è in blacklist, non inviare notifica aggiuntiva
             self.logger.info(f"Gruppo {chat_id} in blacklist, notifica saltata")
             return
 
