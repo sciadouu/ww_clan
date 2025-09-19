@@ -185,6 +185,7 @@ class MemberListService:
                 f"{index}. Game Name: {entry['game_name']} | "
                 f"Username: {entry['telegram_name']} | "
                 f"tag telegram: {entry['telegram_contact']}"
+                f"tag telegram(se presente): {entry['telegram_tag']}"
             )
             messages.append(f"{prefix}{line}")
         return messages
