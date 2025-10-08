@@ -44,6 +44,9 @@ class MissionService:
     reward_service: Optional[RewardService] = None
     authorized_group_ids: Sequence[int] = field(default_factory=tuple)
     owner_id: Optional[int] = None
+    _authorized_group_ids: Set[int] = field(
+        init=False, default_factory=set, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         self._authorized_group_ids: Set[int] = {
