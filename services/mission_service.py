@@ -768,6 +768,38 @@ class MissionService:
         )
         await state.set_state(MissionStates.CONFIRMING_PARTICIPANTS)
 
+    def _build_mission_cost_summary(
+        self,
+        mission: Optional[Dict[str, Any]],
+        participant_count: int,
+    ) -> str:
+        is_gem_mission = bool(mission and mission.get("purchasableWithGems", False))
+        cost_per_participant = 0
+
+        if is_gem_mission:
+            if participant_count > 7:
+                cost_per_participant = 140
+            elif 5 <= participant_count <= 7:
+                cost_per_participant = 150
+            else:
+                cost_per_participant = 0
+        else:
+            cost_per_participant = 500 if participant_count > 0 else 0
+
+        if cost_per_participant == 0:
+            return "💰 Costo missione: Nessun costo aggiuntivo previsto."
+
+        total_cost = cost_per_participant * participant_count
+        currency_total = "Gemme" if is_gem_mission else "Oro"
+        currency_per = "gemme" if is_gem_mission else "oro"
+        participant_label = "partecipante" if participant_count == 1 else "partecipanti"
+
+        return (
+            "💰 Costo missione: "
+            f"{total_cost} {currency_total} totali "
+            f"({cost_per_participant} {currency_per} per {participant_label})."
+        )
+
     async def enable_votes_callback(
         self, callback: types.CallbackQuery, state: FSMContext
     ) -> None:
@@ -784,14 +816,26 @@ class MissionService:
             data = await state.get_data()
             mission_player_ids_raw = data.get("mission_player_ids", [])
             selected_mission_id = data.get("selected_mission_id")
+            available_missions = data.get("available_missions", [])
+
+            mission_info: Optional[Dict[str, Any]] = None
+            if isinstance(available_missions, list):
+                for mission in available_missions:
+                    if not isinstance(mission, dict):
+                        continue
+                    mission_id_candidate = str(mission.get("id"))
+                    if mission_id_candidate == selected_mission_id:
+                        mission_info = mission
+                        break
 
             mission_player_ids = [str(pid) for pid in mission_player_ids_raw]
             mission_player_ids = list(dict.fromkeys(mission_player_ids))
+            participant_count = len(mission_player_ids)
 
             self.logger.info(
                 "Missione %s: abilito %s partecipanti dal voto",
                 selected_mission_id,
-                len(mission_player_ids),
+                participant_count,
             )
 
             if not mission_player_ids:
@@ -899,13 +943,24 @@ class MissionService:
                     ) as resp:
                         claim_body = await resp.text()
                         if resp.status in [200, 201, 204]:
-                            await callback.message.answer(
-                                "🚀 Missione avviata con successo."
+                            cost_summary = self._build_mission_cost_summary(
+                                mission_info,
+                                participant_count,
                             )
+                            message_lines = [
+                                "🚀 Missione avviata con successo.",
+                                cost_summary,
+                            ]
+                            await callback.message.answer("\n".join(message_lines))
                             self.logger.info(
                                 "Missione %s avviata con successo: %s",
                                 selected_mission_id,
                                 claim_body,
+                            )
+                            self.logger.info(
+                                "Missione %s costo stimato: %s",
+                                selected_mission_id,
+                                cost_summary,
                             )
                         else:
                             self.logger.error(

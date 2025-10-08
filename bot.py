@@ -237,6 +237,7 @@ register_user_flow_handlers(
     wolvesville_api_key=WOLVESVILLE_API_KEY,
     clan_id=CLAN_ID,
     skip_image_path=SKIP_IMAGE_PATH,
+    owner_id=OWNER_CHAT_ID,
     admin_ids=ADMIN_IDS,
     authorized_groups=AUTHORIZED_GROUPS,
     schedule_admin_notification=schedule_admin_notification,

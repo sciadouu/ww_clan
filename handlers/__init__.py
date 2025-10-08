@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 from aiogram import Bot, Dispatcher
 
@@ -36,6 +36,7 @@ def register_user_flow_handlers(
     wolvesville_api_key: str,
     clan_id: str,
     skip_image_path: str,
+    owner_id: Optional[int],
     admin_ids: Sequence[int],
     authorized_groups: Sequence[int],
     schedule_admin_notification: Callable[..., None],
@@ -50,6 +51,8 @@ def register_user_flow_handlers(
         wolvesville_api_key=wolvesville_api_key,
         skip_image_path=skip_image_path,
         logger=logger,
+        authorized_group_ids=authorized_groups,
+        owner_id=owner_id,
     )
 
     balances_handlers = BalancesHandlers(
