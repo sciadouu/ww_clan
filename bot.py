@@ -189,6 +189,8 @@ mission_service = MissionService(
     clan_id=CLAN_ID,
     logger=logger,
     reward_service=reward_service,
+    authorized_group_ids=AUTHORIZED_GROUPS,
+    owner_id=OWNER_CHAT_ID,
 )
 
 statistics_service = StatisticsService(

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
@@ -42,6 +42,16 @@ class MissionService:
     clan_chat_id: Optional[int] = None
     clan_topic_id: Optional[int] = None
     reward_service: Optional[RewardService] = None
+    authorized_group_ids: Sequence[int] = field(default_factory=tuple)
+    owner_id: Optional[int] = None
+    _authorized_group_ids: Set[int] = field(
+        init=False, default_factory=set, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        self._authorized_group_ids: Set[int] = {
+            int(chat_id) for chat_id in (self.authorized_group_ids or [])
+        }
 
     # ---------------------------------------------------------------------
     # Public API used by other components (scheduler, commands, services)
@@ -277,6 +287,66 @@ class MissionService:
         )
 
         return event_id
+
+    def _is_mission_enable_allowed(
+        self, chat: Optional[types.Chat], user_id: Optional[int]
+    ) -> bool:
+        if chat is None:
+            return False
+
+        chat_type = getattr(chat, "type", "") or ""
+        chat_id = getattr(chat, "id", None)
+
+        if chat_type == "private":
+            return bool(
+                user_id is not None
+                and self.owner_id is not None
+                and user_id == self.owner_id
+            )
+
+        if chat_id is None:
+            return False
+
+        if self._authorized_group_ids:
+            try:
+                return int(chat_id) in self._authorized_group_ids
+            except (TypeError, ValueError):
+                return False
+
+        return chat_type in {"group", "supergroup"}
+
+    async def _handle_mission_enable_denied(
+        self,
+        *,
+        message: Optional[types.Message],
+        callback: Optional[types.CallbackQuery],
+        user_id: Optional[int],
+    ) -> None:
+        warning_text = (
+            "❌ Il comando /partecipanti può essere utilizzato solo nel gruppo del clan."
+            " In privato è consentito esclusivamente all'owner."
+        )
+
+        if callback is not None:
+            try:
+                await callback.answer("Accesso negato", show_alert=True)
+            except Exception:  # pragma: no cover - not critical if alert fails
+                pass
+
+        if message is not None:
+            try:
+                await message.answer(warning_text)
+            except Exception:  # pragma: no cover - avoid breaking flow on send failure
+                pass
+
+            chat = getattr(message, "chat", None)
+            chat_id = getattr(chat, "id", "unknown") if chat else "unknown"
+            if user_id is not None:
+                self.logger.warning(
+                    "Mission participant enable denied for user %s in chat %s",
+                    user_id,
+                    chat_id,
+                )
 
     async def capture_clan_context(self, message: types.Message) -> None:
         """Memorizza chat e topic del clan per gli annunci automatici."""
@@ -767,6 +837,14 @@ class MissionService:
     async def partecipanti_command(
         self, message: types.Message, state: FSMContext
     ) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if not self._is_mission_enable_allowed(message.chat, user_id):
+            await self._handle_mission_enable_denied(
+                message=message, callback=None, user_id=user_id
+            )
+            await state.clear()
+            return
+
         await self.capture_clan_context(message)
 
         missions = await self.get_available_missions()
@@ -800,6 +878,15 @@ class MissionService:
     async def mission_select_callback(
         self, callback: types.CallbackQuery, state: FSMContext
     ) -> None:
+        chat = callback.message.chat if callback.message else None
+        user_id = callback.from_user.id if callback.from_user else None
+        if not self._is_mission_enable_allowed(chat, user_id):
+            await self._handle_mission_enable_denied(
+                message=callback.message, callback=callback, user_id=user_id
+            )
+            await state.clear()
+            return
+
         selected_mission_id = callback.data.split("mission_select_")[-1]
         try:
             await callback.message.delete()
@@ -886,6 +973,15 @@ class MissionService:
     async def enable_votes_callback(
         self, callback: types.CallbackQuery, state: FSMContext
     ) -> None:
+        chat = callback.message.chat if callback.message else None
+        user_id = callback.from_user.id if callback.from_user else None
+        if not self._is_mission_enable_allowed(chat, user_id):
+            await self._handle_mission_enable_denied(
+                message=callback.message, callback=callback, user_id=user_id
+            )
+            await state.clear()
+            return
+
         parts = callback.data.split("_")
         decision = parts[2]
         try:
