@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Iterable, Optional, Set
 
 import aiohttp
 from aiogram import Router, types
@@ -27,11 +28,17 @@ class MissionHandlers:
         wolvesville_api_key: str,
         skip_image_path: str,
         logger,
+        authorized_group_ids: Optional[Iterable[int]] = None,
+        owner_id: Optional[int] = None,
     ) -> None:
         self.clan_id = clan_id
         self.wolvesville_api_key = wolvesville_api_key
         self.skip_image_path = skip_image_path
         self.logger = logger
+        self.authorized_group_ids: Set[int] = {
+            int(chat_id) for chat_id in authorized_group_ids or []
+        }
+        self.owner_id = owner_id
 
         self.router = Router()
         self.router.callback_query.register(
@@ -41,20 +48,24 @@ class MissionHandlers:
     async def start_flow(self, message: types.Message, state: FSMContext) -> None:
         """Present the mission menu with skip/skin options."""
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Skin",
-                        callback_data=MissionCallback(action="skin").pack(),
-                    ),
-                    InlineKeyboardButton(
-                        text="Skip",
-                        callback_data=MissionCallback(action="skip").pack(),
-                    ),
-                ]
-            ]
-        )
+        from_user = message.from_user.id if message.from_user else None
+        show_skip = self._is_skip_allowed(message.chat, from_user)
+
+        row = [
+            InlineKeyboardButton(
+                text="Skin",
+                callback_data=MissionCallback(action="skin").pack(),
+            )
+        ]
+        if show_skip:
+            row.append(
+                InlineKeyboardButton(
+                    text="Skip",
+                    callback_data=MissionCallback(action="skip").pack(),
+                )
+            )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[row])
         await message.answer("Missioni", reply_markup=keyboard)
 
     async def handle_mission_callback(
@@ -75,6 +86,28 @@ class MissionHandlers:
         else:
             await self._handle_skins(callback)
 
+    def _is_skip_allowed(
+        self,
+        chat: Optional[types.Chat],
+        user_id: Optional[int],
+    ) -> bool:
+        if chat is None:
+            return False
+
+        chat_type = getattr(chat, "type", "")
+        chat_id = getattr(chat, "id", None)
+
+        if chat_type == "private":
+            return user_id is not None and user_id == self.owner_id
+
+        if chat_id is None:
+            return False
+
+        if self.authorized_group_ids:
+            return chat_id in self.authorized_group_ids
+
+        return chat_type in {"group", "supergroup"}
+
     async def _handle_skip(self, callback: types.CallbackQuery) -> None:
         url = (
             f"https://api.wolvesville.com/clans/{self.clan_id}/quests/active/skipWaitingTime"
@@ -82,6 +115,21 @@ class MissionHandlers:
 
         user_id = callback.from_user.id
         username = callback.from_user.username or callback.from_user.first_name
+
+        if not self._is_skip_allowed(callback.message.chat, user_id):
+            warning_text = (
+                "❌ Il comando /skip missione può essere utilizzato solo nel gruppo del clan."
+                " In privato è consentito esclusivamente all'owner."
+            )
+            if self.owner_id is not None and user_id != self.owner_id:
+                chat_id = callback.message.chat.id if callback.message else "unknown"
+                self.logger.warning(
+                    "Skip command denied for user %s in chat %s", user_id, chat_id
+                )
+            await callback.answer("Accesso negato", show_alert=True)
+            await callback.message.answer(warning_text)
+            return
+
         self.logger.info(
             "Skip command requested by user %s (%s)",
             user_id,
