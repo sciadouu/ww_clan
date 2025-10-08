@@ -33,6 +33,9 @@ class MongoManager:
         self.member_list_messages_col: AsyncIOMotorCollection = self._database[
             "member_list_messages"
         ]
+        self.mission_context_col: AsyncIOMotorCollection = self._database[
+            "mission_context"
+        ]
 
     @property
     def database(self) -> AsyncIOMotorDatabase:
@@ -1172,6 +1175,46 @@ class MongoManager:
             update_statement,
             upsert=True,
         )
+
+    async def get_mission_announcement_context(self) -> Optional[Dict[str, Any]]:
+        """Restituisce la chat e il topic utilizzati per gli annunci missione."""
+
+        document = await self.mission_context_col.find_one({"_id": "weekly_announcement"})
+        if not document:
+            return None
+
+        return {
+            "chat_id": document.get("chat_id"),
+            "message_thread_id": document.get("message_thread_id"),
+            "updated_at": document.get("updated_at"),
+        }
+
+    async def upsert_mission_announcement_context(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: Optional[int],
+    ) -> None:
+        """Aggiorna il contesto (chat/topic) usato per l'annuncio settimanale."""
+
+        payload: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "message_thread_id": int(message_thread_id)
+            if message_thread_id is not None
+            else None,
+            "updated_at": datetime.now(timezone.utc),
+        }
+
+        await self.mission_context_col.update_one(
+            {"_id": "weekly_announcement"},
+            {"$set": payload},
+            upsert=True,
+        )
+
+    async def delete_mission_announcement_context(self) -> None:
+        """Rimuove il contesto salvato per gli annunci missione."""
+
+        await self.mission_context_col.delete_one({"_id": "weekly_announcement"})
 
     async def list_member_list_messages(self) -> List[Dict[str, Any]]:
         """Restituisce tutti i messaggi registrati per la lista membri."""

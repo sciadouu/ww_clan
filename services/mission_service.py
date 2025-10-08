@@ -278,6 +278,84 @@ class MissionService:
 
         return event_id
 
+    async def capture_clan_context(self, message: types.Message) -> None:
+        """Memorizza chat e topic del clan per gli annunci automatici."""
+
+        chat = getattr(message, "chat", None)
+        if chat is None:
+            return
+
+        chat_type = getattr(chat, "type", "") or ""
+        if chat_type not in {"group", "supergroup"}:
+            return
+
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            return
+
+        thread_id_raw = getattr(message, "message_thread_id", None)
+        thread_id: Optional[int]
+        try:
+            thread_id = int(thread_id_raw) if thread_id_raw is not None else None
+        except (TypeError, ValueError):
+            thread_id = None
+
+        self.clan_chat_id = int(chat_id)
+        self.clan_topic_id = thread_id
+
+        try:
+            await self.db_manager.upsert_mission_announcement_context(
+                chat_id=int(chat_id), message_thread_id=thread_id
+            )
+        except Exception as exc:  # pragma: no cover - log difensivo
+            self.logger.warning(
+                "Impossibile salvare il contesto missione: %s", exc
+            )
+
+    async def _ensure_clan_context(self) -> bool:
+        """Recupera da database la chat del clan se non è già nota."""
+
+        if self.clan_chat_id is not None:
+            return True
+
+        try:
+            record = await self.db_manager.get_mission_announcement_context()
+        except Exception as exc:  # pragma: no cover - log difensivo
+            self.logger.warning(
+                "Recupero contesto missione fallito: %s", exc
+            )
+            return False
+
+        if not record:
+            return False
+
+        chat_id = record.get("chat_id")
+        if chat_id is None:
+            return False
+
+        try:
+            self.clan_chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "Chat ID non valido nel contesto missione salvato: %s", chat_id
+            )
+            return False
+
+        thread_id = record.get("message_thread_id")
+        if thread_id is None:
+            self.clan_topic_id = None
+        else:
+            try:
+                self.clan_topic_id = int(thread_id)
+            except (TypeError, ValueError):
+                self.logger.debug(
+                    "Topic ID non valido nel contesto missione salvato: %s",
+                    thread_id,
+                )
+                self.clan_topic_id = None
+
+        return True
+
     async def process_active_mission_auto(self) -> None:
         """Resolve the currently active mission, apply costs and store history."""
 
@@ -474,6 +552,9 @@ class MissionService:
 
     async def send_weekly_mission_skin(self) -> None:
         """Announce weekly missions and post the available skins."""
+
+        if self.clan_chat_id is None:
+            await self._ensure_clan_context()
 
         if self.clan_chat_id is None:
             self.logger.warning(
@@ -686,6 +767,8 @@ class MissionService:
     async def partecipanti_command(
         self, message: types.Message, state: FSMContext
     ) -> None:
+        await self.capture_clan_context(message)
+
         missions = await self.get_available_missions()
         if not missions:
             await message.answer("Nessuna missione disponibile al momento.")
