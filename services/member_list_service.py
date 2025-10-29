@@ -6,7 +6,7 @@ import asyncio
 import html
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence
 
 import aiohttp
 from aiogram import Bot, types
@@ -58,6 +58,7 @@ class MemberListService:
                     chat_id,
                     message_ids,
                     message_thread_id=thread_id,
+                    message_texts=messages_payload,
                 )
             else:
                 await self.db_manager.delete_member_list_message(chat_id, thread_id)
@@ -91,26 +92,60 @@ class MemberListService:
                 if stored_message_ids:
                     stored_message_ids = list(dict.fromkeys(stored_message_ids))
 
-                if chat_id is None or not stored_message_ids:
+                if chat_id is None:
                     continue
 
+                stored_texts_raw = entry.get("message_texts")
+                stored_texts: List[str] = []
+                if isinstance(stored_texts_raw, Sequence):
+                    for value in stored_texts_raw:
+                        if isinstance(value, str):
+                            stored_texts.append(value)
+
+                if not stored_message_ids or len(stored_message_ids) != len(stored_texts):
+                    await self._refresh_entire_list(chat_id, thread_id, messages_payload)
+                    await asyncio.sleep(0.2)
+                    continue
+
+                divergence_index = self._first_difference_index(
+                    stored_texts, messages_payload
+                )
+
+                if divergence_index is None:
+                    await self.db_manager.upsert_member_list_message(
+                        chat_id,
+                        stored_message_ids,
+                        message_thread_id=thread_id,
+                        message_texts=messages_payload,
+                    )
+                    await asyncio.sleep(0.05)
+                    continue
+
+                preserved_ids = stored_message_ids[:divergence_index]
+                ids_to_remove = stored_message_ids[divergence_index:]
+
                 should_remove_entry = False
-                remove_record = False
-                for stored_id in stored_message_ids:
+                for stored_id in ids_to_remove:
                     try:
                         await self.bot.delete_message(chat_id, stored_id)
                     except TelegramForbiddenError:
                         should_remove_entry = True
                         self.logger.info(
-                            "Impossibile aggiornare la lista membri in %s: accesso negato", chat_id
+                            "Impossibile aggiornare la lista membri in %s: accesso negato",
+                            chat_id,
                         )
                         break
                     except TelegramBadRequest as exc:
                         if "message to delete not found" in str(exc):
-                            remove_record = True
+                            self.logger.debug(
+                                "Messaggio %s non trovato durante l'aggiornamento lista in %s",
+                                stored_id,
+                                chat_id,
+                            )
                         else:
                             self.logger.debug(
-                                "Messaggio lista membri non eliminato (%s): %s",
+                                "Impossibile eliminare il messaggio %s in %s: %s",
+                                stored_id,
                                 chat_id,
                                 exc,
                             )
@@ -121,15 +156,13 @@ class MemberListService:
                             exc,
                         )
 
-                if remove_record:
-                    await self.db_manager.delete_member_list_message(chat_id, thread_id)
-
                 if should_remove_entry:
                     await self.db_manager.delete_member_list_message(chat_id, thread_id)
                     continue
 
                 sent_messages: List[types.Message] = []
-                for index, text in enumerate(messages_payload):
+                send_texts = messages_payload[divergence_index:]
+                for index, text in enumerate(send_texts):
                     try:
                         send_operation = lambda text=text: self.bot.send_message(
                             chat_id,
@@ -157,7 +190,7 @@ class MemberListService:
                         break
 
                     sent_messages.append(sent)
-                    if index + 1 < len(messages_payload):
+                    if index + 1 < len(send_texts):
                         await asyncio.sleep(self._MESSAGE_DELAY_SECONDS)
 
                 if should_remove_entry:
@@ -168,18 +201,24 @@ class MemberListService:
                             pass
                     continue
 
-                message_ids = [sent.message_id for sent in sent_messages]
-                if not message_ids:
+                combined_ids = preserved_ids + [sent.message_id for sent in sent_messages]
+                if not combined_ids:
                     await self.db_manager.delete_member_list_message(chat_id, thread_id)
+                    continue
+
+                deduped_ids = list(dict.fromkeys(combined_ids))
+                if len(deduped_ids) != len(messages_payload):
+                    await self._refresh_entire_list(chat_id, thread_id, messages_payload)
+                    await asyncio.sleep(0.2)
                     continue
 
                 await self.db_manager.upsert_member_list_message(
                     chat_id,
-                    message_ids,
+                    deduped_ids,
                     message_thread_id=thread_id,
+                    message_texts=messages_payload,
                 )
                 await asyncio.sleep(0.2)
-
     async def _build_member_messages(self) -> List[str]:
         entries = await self._collect_member_entries()
         if not entries:
@@ -245,6 +284,67 @@ class MemberListService:
             )
 
         return entries
+
+    @staticmethod
+    def _first_difference_index(
+        existing: Sequence[str], updated: Sequence[str]
+    ) -> Optional[int]:
+        max_index = min(len(existing), len(updated))
+        for index in range(max_index):
+            if existing[index] != updated[index]:
+                return index
+        if len(existing) != len(updated):
+            return max_index
+        return None
+
+    async def _refresh_entire_list(
+        self,
+        chat_id: int,
+        thread_id: Optional[int],
+        messages_payload: Sequence[str],
+    ) -> None:
+        await self._remove_previous_message(chat_id, thread_id)
+
+        sent_messages: List[types.Message] = []
+        for index, text in enumerate(messages_payload):
+            try:
+                send_operation = lambda text=text: self.bot.send_message(
+                    chat_id,
+                    text,
+                    parse_mode="HTML",
+                    message_thread_id=thread_id,
+                )
+                sent = await self._send_with_retry(send_operation)
+            except TelegramForbiddenError:
+                await self.db_manager.delete_member_list_message(chat_id, thread_id)
+                self.logger.info(
+                    "Impossibile inviare la lista membri in %s: accesso negato",
+                    chat_id,
+                )
+                return
+            except Exception as exc:  # pragma: no cover - log difensivo
+                await self.db_manager.delete_member_list_message(chat_id, thread_id)
+                self.logger.warning(
+                    "Errore durante l'invio completo della lista membri in %s: %s",
+                    chat_id,
+                    exc,
+                )
+                return
+
+            sent_messages.append(sent)
+            if index + 1 < len(messages_payload):
+                await asyncio.sleep(self._MESSAGE_DELAY_SECONDS)
+
+        message_ids = [sent.message_id for sent in sent_messages]
+        if message_ids:
+            await self.db_manager.upsert_member_list_message(
+                chat_id,
+                message_ids,
+                message_thread_id=thread_id,
+                message_texts=list(messages_payload),
+            )
+        else:
+            await self.db_manager.delete_member_list_message(chat_id, thread_id)
 
     async def _fetch_clan_members(self) -> List[Dict[str, str]]:
         url = f"https://api.wolvesville.com/clans/{self.clan_id}/members"

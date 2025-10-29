@@ -88,13 +88,19 @@ class MaintenanceService:
             )
             return
 
-        current_usernames = {
-            member.get("username")
-            for member in current_members
-            if isinstance(member, dict)
-            and isinstance(member.get("username"), str)
-            and member.get("username")
-        }
+        current_usernames: set[str] = set()
+        current_usernames_map: dict[str, str] = {}
+        for member in current_members:
+            if not isinstance(member, dict):
+                continue
+            raw_username = member.get("username")
+            if not isinstance(raw_username, str):
+                continue
+            normalized_username = raw_username.strip()
+            if not normalized_username:
+                continue
+            current_usernames.add(normalized_username)
+            current_usernames_map[normalized_username.lower()] = normalized_username
 
         try:
             db_users = await self._db_manager.list_users()
@@ -107,8 +113,58 @@ class MaintenanceService:
 
         for user in db_users:
             username = user.get("username")
-            if not username or username in current_usernames:
+            if not username:
                 continue
+
+            normalized_username = username.strip()
+            if not normalized_username:
+                continue
+
+            if normalized_username in current_usernames:
+                continue
+
+            try:
+                identity = await self._identity_service.resolve_member_identity(
+                    normalized_username
+                )
+            except Exception as exc:
+                self._logger.debug(
+                    "Impossibile risolvere l'identità per %s: %s",
+                    normalized_username,
+                    exc,
+                )
+                identity = {}
+
+            resolved_username = identity.get("resolved_username")
+            resolved_normalized = (
+                resolved_username.strip() if isinstance(resolved_username, str) else ""
+            )
+
+            if (
+                resolved_normalized
+                and resolved_normalized.lower() in current_usernames_map
+                and resolved_normalized.lower() != normalized_username.lower()
+            ):
+                target_username = current_usernames_map[resolved_normalized.lower()]
+                try:
+                    migrate_result = await self._db_manager.migrate_user_record(
+                        normalized_username, target_username
+                    )
+                except Exception as exc:
+                    self._logger.warning(
+                        "Migrazione del bilancio da %s a %s non riuscita: %s",
+                        normalized_username,
+                        target_username,
+                        exc,
+                    )
+                else:
+                    self._logger.info(
+                        "Allineato cambio username %s → %s (risultato: %s)",
+                        normalized_username,
+                        target_username,
+                        migrate_result.get("status"),
+                    )
+                    continue
 
             donazioni = user.get("donazioni", {})
             oro = donazioni.get("Oro", 0)
