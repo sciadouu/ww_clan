@@ -1152,6 +1152,7 @@ class MongoManager:
         message_ids: Sequence[int],
         *,
         message_thread_id: Optional[int] = None,
+        message_texts: Optional[Sequence[str]] = None,
     ) -> None:
         """Crea o aggiorna la registrazione del messaggio lista membri."""
 
@@ -1169,6 +1170,12 @@ class MongoManager:
             update_payload["message_id"] = safe_ids[0]
         else:
             update_statement.setdefault("$unset", {})["message_id"] = ""
+
+        if message_texts is not None:
+            safe_texts = [str(text) for text in message_texts]
+            update_payload["message_texts"] = safe_texts
+        else:
+            update_statement.setdefault("$unset", {})["message_texts"] = ""
 
         await self.member_list_messages_col.update_one(
             {"chat_id": chat_id, "message_thread_id": message_thread_id},
